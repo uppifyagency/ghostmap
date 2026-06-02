@@ -1,0 +1,16 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Node (none required at runtime, but just in case)
+node_modules/
+npm-debug.log*
+
+# Build / packaging artifacts
+*.zip
+*.crx
+*.pem
+*.log

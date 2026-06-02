@@ -1,0 +1,89 @@
+{
+  "manifest_version": 3,
+  "name": "Ghost Map Pro",
+  "version": "9.12.13",
+  "description": "Extract business leads from Google Business Profiles with smart email discovery and export.",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "offscreen",
+    "sidePanel",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://www.google.com/maps/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background/sw.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open Ghost Map",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "ui/sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.google.com/maps/*"
+      ],
+      "js": [
+        "content/gmb/loader.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.google.com/maps/*"
+      ],
+      "js": [
+        "content/gmb/maps-state-watcher.js",
+        "content/gmb/detail-fetcher.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "assets/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    },
+    {
+      "_comment_co_8": "CO-8 FIX (2026-05-10): content/gmb/*.js and lib/*.js are the watcher scripts injected by observer.js's R-STATE FALLBACK path. Pre-fix they were exposed to <all_urls>, which meant ANY website could <script src='chrome-extension://[EXTENSION_ID]/content/gmb/maps-state-watcher.js'> and (a) execute the watcher in its own page context, (b) use script.onload as a binary oracle to fingerprint extension users + leak the EXTENSION_ID. Now restricted to Google Maps origins, the only legitimate consumer. The fallback path in observer.js:295 still works because it injects only into Maps pages.",
+      "resources": [
+        "content/gmb/*.js",
+        "lib/*.js"
+      ],
+      "matches": [
+        "https://www.google.com/*",
+        "https://maps.google.com/*",
+        "https://www.google.it/*",
+        "https://maps.google.it/*",
+        "https://www.google.de/*",
+        "https://www.google.fr/*",
+        "https://www.google.es/*",
+        "https://www.google.co.uk/*"
+      ]
+    }
+  ]
+}
