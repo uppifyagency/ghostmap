@@ -454,6 +454,36 @@
         }
     });
 
+    /**
+     * SEC-01 (2026-06-09): strict schema/format validation for an inbound
+     * detail request BEFORE it drives an authenticated /maps/preview/place
+     * fetch. `event.source === window` is not enough — any script co-located
+     * on the Maps page can forge this message. placeId, lat and lng are
+     * interpolated RAW into the pb param (buildDetailUrl), so a forged payload
+     * could otherwise inject arbitrary query state into the authenticated
+     * request. Each rule mirrors exactly what observer.js:_idsFromUrl emits,
+     * so no legitimate request is rejected.
+     */
+    function isValidDetailPayload(p) {
+        if (!p || typeof p !== 'object') return false;
+        // Coordinates: interpolated RAW — finite numbers within geographic range.
+        if (typeof p.lat !== 'number' || !Number.isFinite(p.lat) || p.lat < -90 || p.lat > 90) return false;
+        if (typeof p.lng !== 'number' || !Number.isFinite(p.lng) || p.lng < -180 || p.lng > 180) return false;
+        // placeId: interpolated RAW (String(), not encoded) — Maps id charset only.
+        if (typeof p.placeId !== 'string' || p.placeId.length < 1 || p.placeId.length > 256
+            || !/^[A-Za-z0-9_-]+$/.test(p.placeId)) return false;
+        // cid: observer always emits "0xHEX:0xHEX" (see _cidFromUrl).
+        if (typeof p.cid !== 'string' || p.cid.length > 64
+            || !/^0x[0-9a-f]+:0x[0-9a-f]+$/i.test(p.cid)) return false;
+        // fid: variable shape ("/g/…", "/0x..:0x..") and encodeURIComponent'd
+        // downstream — bound length and forbid URL-control / control chars.
+        if (typeof p.fid !== 'string' || p.fid.length < 1 || p.fid.length > 128
+            || /[\x00-\x1f!?&#]/.test(p.fid)) return false;
+        return true;
+    }
+    // Exposed for diagnostics + tests (cf. window.__ghostMapDetailFetcherStats).
+    window.__ghostMapValidateDetailPayload = isValidDetailPayload;
+
     /** Public message API — observer.js sends here. */
     window.addEventListener('message', (event) => {
         if (event.source !== window) return;
@@ -461,12 +491,13 @@
         if (!msg || msg.type !== REQUEST_CHANNEL) return;
         const { id, payload } = msg;
         if (!id || !payload) return;
-        if (!payload.cid || !payload.fid || !payload.placeId || payload.lat == null || payload.lng == null) {
+        // SEC-01: reject anything that isn't the exact shape observer.js sends.
+        if (!isValidDetailPayload(payload)) {
             window.postMessage({
                 type: RESPONSE_CHANNEL,
                 id,
                 ok: false,
-                error: 'missing_fields',
+                error: 'invalid_payload',
             }, location.origin);
             return;
         }

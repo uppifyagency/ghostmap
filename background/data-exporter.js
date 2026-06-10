@@ -60,7 +60,7 @@ export async function exportData() {
  * @param {string} rawEmails - Comma-separated email string from database
  * @returns {string} - Cleaned comma-separated emails
  */
-function cleanEmailsForCsv(rawEmails) {
+export function cleanEmailsForCsv(rawEmails) {
     if (!rawEmails || typeof rawEmails !== 'string') return '';
 
     // BLOCK-M1 FIX: Use centralized blacklist from CONFIG (single source of truth)
@@ -80,8 +80,13 @@ function cleanEmailsForCsv(rawEmails) {
         // Skip if no valid structure
         if (!localPart || !domain) continue;
 
-        // Skip blocked domains (centralized blacklist includes tracking, placeholder, and test domains)
-        if (blockedDomains.some(d => domain.includes(d) || domain === d)) continue;
+        // EXP-02 FIX (2026-06-09): suffix-match, NOT substring. The extraction
+        // filters (offscreen/parser.js:428, background/index.js) already use this
+        // exact form. `domain.includes(d)` wrongly dropped legitimate addresses
+        // whose domain merely CONTAINS a blacklist entry — e.g. negoziowix.com
+        // vs `wix.co`, ecotest.com vs `test.co`, subdomain.com vs `domain.co`.
+        // Those emails were in the DB but silently vanished from CSV/MD exports.
+        if (blockedDomains.some(d => domain === d || domain.endsWith('.' + d))) continue;
 
         // Skip UUID/hash-like local parts (20+ hex chars)
         if (localPart.length >= 20 && /^[a-f0-9]+$/.test(localPart)) continue;

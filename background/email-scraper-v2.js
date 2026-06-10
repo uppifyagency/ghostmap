@@ -22,6 +22,7 @@ import { CONFIG } from '../lib/config.js';
 import { logger } from '../lib/utils.js';
 import { sitemapDiscovery } from '../lib/SitemapDiscovery.js';
 import { updateBusiness } from '../lib/db.js';
+import { buildBusinessUpdates } from '../lib/businessUpdates.js'; // PIVA-01
 import { setupOffscreenDocument } from './offscreen-manager.js'; // HIGH FIX #5
 // B4-1: SessionPool no longer eager-imported — resolved lazily via _getPool()
 // from ServiceContainer to preserve restoreFromStorage semantics. The unused
@@ -600,6 +601,26 @@ let currentUserAgentIndex = 0;
  * @param {string} url - URL to validate
  * @returns {boolean} - True if URL is scrapable
  */
+/**
+ * MAN-01 FOLLOW-THROUGH (2026-06-10): coerce a URL's scheme to https.
+ *
+ * The codebase already DECLARES "Force HTTPS for all scraped URLs" (see
+ * isValidScrapableUrl / P1-1 below), but that rewrite was applied only to a
+ * throwaway validation copy — the real fetch used the verbatim http:// URL.
+ * That was harmless while host_permissions granted the http host wildcard;
+ * once MAN-01 removed that grant, an http website fetch is blocked by Chrome (no
+ * matching host permission), silently losing every http-only-website lead.
+ * This helper makes the stated intent real at the point of use. `^` is
+ * anchored so an `http://` inside a path/query is left untouched.
+ *
+ * @param {string} url
+ * @returns {string} url with a leading http:// rewritten to https:// (else unchanged)
+ */
+export function toHttpsUrl(url) {
+    if (!url || typeof url !== 'string') return url;
+    return url.replace(/^http:\/\//i, 'https://');
+}
+
 export function isValidScrapableUrl(url) {
     if (!url || typeof url !== 'string') return false;
 
@@ -1340,6 +1361,14 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     logger.info(`┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
     logger.info(`[DEBUG_UI] scrapeEmailForBusiness called for ${business.title}`);
 
+    // MAN-01 FOLLOW-THROUGH (2026-06-10): coerce the website to https BEFORE any
+    // fetch/navigation. http://*/* was removed from host_permissions, so an
+    // http:// fetch would now be blocked by Chrome. Coercing here — the single
+    // entry point — covers the homepage fetch, generated page URLs, sitemap
+    // discovery, and the tab fallback (all derive from business.website) and
+    // normalizes the persisted record to https (the stated "Force HTTPS" intent).
+    if (business.website) business.website = toHttpsUrl(business.website);
+
     // FIX-003: Extract domain for circuit breaker
     let domain = 'unknown';
     try {
@@ -1466,15 +1495,12 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
                     // CRITICAL BUG FIX: Must save to database before returning!
                     // Previously emails were found but never persisted
                     const emailList = Array.from(allEmails);
-                    const updates = {
-                        email: emailList.join(', ') || '',
-                        social: socialLinks,
-                        emailScraped: true,
-                        scrapedAt: Date.now(),
+                    // PIVA-01: helper omits partitaIva/codiceFiscale/social when
+                    // empty so this early-exit save never clobbers prior enrichment.
+                    const updates = buildBusinessUpdates({
+                        emailList, socialLinks, italianTaxCodes,
                         scrapedFrom: successfulPage || homepageUrl,
-                        partitaIva: italianTaxCodes.partitaIva || null,
-                        codiceFiscale: italianTaxCodes.codiceFiscale || null
-                    };
+                    });
                     const updatedBusiness = { ...business, ...updates };
                     await updateBusiness(updatedBusiness);
                     logger.info(`✓✓✓ [SAVE] Saved ${allEmails.size} email(s) to database (speculative early-exit)`);
@@ -1775,9 +1801,12 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
         if (error.message === 'CLOUDFLARE_PROTECTED') {
             logger.warn(`[CLOUDFLARE] Site protected: ${business.website}`);
 
+            // PIVA-01: omit `social` (and the P.IVA/C.F. keys it never set) so a
+            // Cloudflare hit on a re-scrape preserves enrichment found by a
+            // previous run instead of wiping it with {} — same data-loss class
+            // as the main save branch.
             const cloudflareUpdates = {
                 email: '',
-                social: {},
                 emailScraped: true,
                 scrapedAt: Date.now(),
                 scrapedFrom: 'cloudflare_protected',
@@ -1897,21 +1926,14 @@ export async function scrapeEmailForBusiness(business, currentBusinessName, pars
     logger.info(`[STATS] Session: ${stats.requestsFinished} requests, ${stats.emailsFound} emails, ${stats.successRate} success rate`);
     _getStats().logProgress();
 
-    const updates = {
-        email: emailList.join(', ') || '',
-        social: socialLinks,
-        emailScraped: true,
-        scrapedAt: Date.now(),
-        scrapedFrom: successfulPage || 'failed',
-        // ITALIAN B2B FEATURE: Store tax codes
-        partitaIva: italianTaxCodes.partitaIva || null,
-        codiceFiscale: italianTaxCodes.codiceFiscale || null
-    };
-
-    // If we found no emails, record the last error
-    if (allEmails.size === 0 && lastError) {
-        updates.scrapeError = lastError.message;
-    }
+    // PIVA-01: helper writes partitaIva/codiceFiscale/social ONLY when found
+    // this run, so a failed/empty re-scrape can't erase values from a previous
+    // run (updateBusiness is a full put). It also records scrapeError when no
+    // email was found this run.
+    const updates = buildBusinessUpdates({
+        emailList, socialLinks, italianTaxCodes,
+        scrapedFrom: successfulPage, lastError,
+    });
 
     const updatedBusiness = { ...business, ...updates };
     await updateBusiness(updatedBusiness);

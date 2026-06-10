@@ -145,11 +145,29 @@ export async function getWebsiteExtractionStatus() {
 // MAIN FUNCTION: Extract websites for businesses missing them
 // =====================================================
 
+// IDX-01 FIX (2026-06-10): single-flight guard, owned BY the function (moved
+// up from the respawn block — two owners of one lock is zero owners). Module
+// variable = same-SW-lifetime scope, which is exactly right: a concurrent
+// second call can only arrive within the same lifetime (UI retry after the
+// 25s channel timeout — the IDX-01 scenario); across eviction the variable
+// is fresh-false so the recovery respawn re-enters cleanly.
+let _runLoopActive = false;
+
 /**
  * Extract websites from Google Maps for businesses that don't have one
  * @returns {Promise<{processed: number, found: number, errors: number}>}
  */
 export async function extractMissingWebsites() {
+    // IDX-01: synchronous check-and-set BEFORE any await — an async state
+    // read here would be theater (the UI retry lands in the same tick).
+    // Pre-fix a second start ALSO reset shouldStop=false on the live run,
+    // cancelling an in-flight user Stop; the guard closes that too.
+    if (_runLoopActive) {
+        logger.warn('[WEBSITE EXTRACTOR] extraction already running — second start rejected (IDX-01)');
+        return { status: 'already_running', processed: 0, found: 0, errors: 0 };
+    }
+    _runLoopActive = true;
+
     logger.info('[WEBSITE EXTRACTOR] Starting extraction for businesses without websites...');
 
     const stats = { processed: 0, found: 0, errors: 0 };
@@ -322,6 +340,9 @@ export async function extractMissingWebsites() {
         logger.error('[WEBSITE EXTRACTOR] Fatal error:', error);
         throw error;
     } finally {
+        // IDX-01: release the single-flight guard FIRST (synchronous) so a
+        // failure in the storage reset below can never wedge the lock.
+        _runLoopActive = false;
         // Always reset running state — both storage (truth) AND mirror.
         await websiteExtractionStateAPI.set({ ...STATE_DEFAULTS });
         _stateCache = { ...STATE_DEFAULTS };
@@ -337,13 +358,10 @@ export async function extractMissingWebsites() {
 // queue: getBusinessesWithoutWebsite() re-derives the work set; we don't
 // persist the queue array.
 //
-// Guard `_runLoopActive` prevents double-spawn if a queued user message
-// (e.g., another `extractMissingWebsites()` call) fires during the same
-// wake cycle as this respawn. Cross-eviction semantics: "no carry-over"
-// (variable is fresh-false on wake; top-level await re-claims it cleanly).
-// SW-EVICTION-SAFE: guard scoped to a single SW lifetime by design.
-let _runLoopActive = false;
-
+// IDX-01 (2026-06-10): the `_runLoopActive` single-flight guard moved INTO
+// extractMissingWebsites itself (declared above it) — it now protects BOTH
+// the respawn below and direct user-message calls. The respawn just calls
+// the function; the guard inside rejects a duplicate in the same wake cycle.
 async function _restoreAndMaybeRespawn() {
     try {
         const restored = await websiteExtractionStateAPI.get();
@@ -362,12 +380,11 @@ async function _restoreAndMaybeRespawn() {
         }
         logger.info('[WEBSITE EXTRACTOR] Eviction recovery: respawning extractMissingWebsites');
         // Defer to next microtask so module init can finish before re-entry.
+        // IDX-01: no flag management here — the single-flight guard lives
+        // inside extractMissingWebsites (caller-managed locking was the bug).
         queueMicrotask(() => {
-            if (_runLoopActive) return;
-            _runLoopActive = true;
             extractMissingWebsites()
-                .catch(err => logger.error('[WEBSITE EXTRACTOR] Re-attached run crashed:', err))
-                .finally(() => { _runLoopActive = false; });
+                .catch(err => logger.error('[WEBSITE EXTRACTOR] Re-attached run crashed:', err));
         });
     } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);

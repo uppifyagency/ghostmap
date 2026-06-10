@@ -554,6 +554,18 @@ async function startWebsiteExtraction() {
 
         const response = await sendMessageWithTimeout({ action: 'extract_missing_websites' });
 
+        // IDX-01 FOLLOW-THROUGH (2026-06-10): the SW now rejects a duplicate
+        // start with { status:'already_running', processed:0, ... }. Without
+        // this branch the zeroed stats fell into the success path below and
+        // the user saw a false "Done! Found 0 websites". Sync to the live
+        // run instead: its website_extraction_progress/_finished broadcasts
+        // (handled below at L1778/L1791) drive the UI from here on.
+        if (response?.status === 'already_running') {
+            state.isExtractingWebsites = true;
+            showToast('Website extraction already in progress', 'info');
+            return; // button stays disabled/spinner — correct: a run IS active
+        }
+
         // C3-003 FIX: Now set state AFTER await confirms backend started
         if (response && response.processed !== undefined) {
             // Set state during active extraction (immediate sync on success)
@@ -1134,7 +1146,16 @@ async function exportMD() {
 }
 
 function downloadFile(content, filename, mimeType) {
-    const blob = new Blob([content], { type: mimeType + ';charset=utf-8;' });
+    // EXP-03 FIX (2026-06-09): prepend a UTF-8 BOM for CSV so Excel opens it as
+    // UTF-8 on double-click — without it accented characters garble ("Caffè" →
+    // "CaffÃ¨"). The failed-modal CSV already does this (ui/failed-modal.js:470);
+    // the main export didn't. Markdown is left untouched (a BOM would render as
+    // a stray glyph in plain-text/markdown viewers).
+    const isCsv = /csv/i.test(mimeType || '');
+    const payload = (isCsv && typeof content === 'string' && !content.startsWith('﻿'))
+        ? '﻿' + content
+        : content;
+    const blob = new Blob([payload], { type: mimeType + ';charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.setAttribute('href', url);
@@ -1630,8 +1651,11 @@ function handleBackgroundMessage(message, sender, sendResponse) {
 
         case 'emailFound':
         case 'email_found':
+            // UI-03 FIX (2026-06-09): the SW broadcasts the address under
+            // payload.email (background/index.js:1914); read that first so the
+            // feed shows the actual email instead of the generic "Email found".
             addActivity({
-                name: message.email || message.business?.email || 'Email found',
+                name: message.payload?.email || message.email || message.business?.email || 'Email found',
                 status: 'success',
                 detail: '+email'
             });

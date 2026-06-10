@@ -588,6 +588,12 @@
 
     window.addEventListener('message', (event) => {
         if (event.source !== window) return;
+        // SEC-01 (2026-06-09): this request carries NO payload — it only starts
+        // the local APP_INITIALIZATION_STATE poll. The optional-chaining type
+        // guard below already rejects any non-object / wrong-type message, so
+        // there is no attacker-controlled value to schema-validate here. The
+        // data-bearing direction (the gmp:state-map RESPONSE) is validated by
+        // its consumer in observer.js (isolated world, CT-4).
         if (event.data?.type !== 'gmp:state-map-request') return;
         lastMapJson = '';
         pollStartedAt = Date.now();

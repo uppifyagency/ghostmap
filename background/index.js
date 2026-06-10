@@ -1572,6 +1572,19 @@ async function _doEnrichmentMerge(existing, fields, dbKey) {
     if (!merged.phone && f.phone) merged.phone = f.phone;
     if (!merged.address && f.address) merged.address = f.address;
     if (!merged.website && f.website) merged.website = f.website;
+    // EXP-01 FIX (2026-06-10): fill latitude/longitude holes from the
+    // enrichment (observer propagates the card-URL coords). Pre-fix these
+    // never merged, so only ~21% of rows (JSPB state catalog) had coords and
+    // the export radius filter ran fail-open on the rest. Type+range
+    // validated here too — different trust boundary than the content script.
+    if (merged.latitude == null && typeof f.latitude === 'number'
+        && Number.isFinite(f.latitude) && Math.abs(f.latitude) <= 90) {
+        merged.latitude = f.latitude;
+    }
+    if (merged.longitude == null && typeof f.longitude === 'number'
+        && Number.isFinite(f.longitude) && Math.abs(f.longitude) <= 180) {
+        merged.longitude = f.longitude;
+    }
     if ((merged.rating == null || merged.rating === '') && f.rating != null) {
         merged.rating = f.rating;
     }

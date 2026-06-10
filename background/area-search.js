@@ -493,7 +493,13 @@ _restoreTurboState()
             queueMicrotask(() => {
                 if (!_runLoopActive) {
                     _runLoopActive = true;
-                    runTurboV3()
+                    // AS-01 FIX (2026-06-10): the interrupted batch's popups are
+                    // orphans (their owner loop died with the SW). Close them
+                    // BEFORE the respawned loop redoes the batch and creates new
+                    // windows — pre-fix they lingered until a manual Stop.
+                    _closeOrphanWindows('TURBO_STATE respawn')
+                        .catch(err => console.warn('[TURBO_STATE] orphan sweep failed:', err?.message || err))
+                        .then(() => runTurboV3())
                         .catch(err => console.error('[TURBO_STATE] Re-attached run loop crashed:', err))
                         .finally(() => { _runLoopActive = false; });
                 }
@@ -2108,9 +2114,9 @@ async function extractEnhanced(tabId) {
                 // WHY: chrome.scripting.executeScript() runs in PAGE CONTEXT, not
                 // extension context. ES6 imports are NOT available here.
                 // 
-                // CANONICAL SOURCE: lib/phone-normalizer.js:normalizePhone (lines 20-66)
+                // CANONICAL SOURCE: lib/phone-normalizer.js:normalizePhone
                 // SYNC REQUIREMENT: Keep this in sync with lib/phone-normalizer.js
-                // Last synced: 2024-12-17 (Block M1 verification)
+                // Last synced: 2026-06-09 (PHONE-01: IT default for 06/07 landlines)
                 // ═══════════════════════════════════════════════════════════════
                 function normalizePhone(phone) {
                     if (!phone) return '';
@@ -2131,9 +2137,14 @@ async function extractEnhanced(tabId) {
                         return '+39' + cleaned;
                     }
 
-                    // French mobile: starts with 06 or 07 (total 10)
+                    // PHONE-01 FIX (2026-06-09): Italian landline (Rome=06, 07).
+                    // This scraper only ever sees Italian Maps data, so a 10-digit
+                    // 06/07 number is an Italian landline, NOT a French mobile.
+                    // Mirrors the IT default in lib/phone-normalizer.js.
                     if (/^0[67]\d{8}$/.test(cleaned)) {
-                        return '+33' + cleaned.substring(1);
+                        const areaCode = cleaned.substring(0, 2);
+                        const subscriber = cleaned.substring(2);
+                        return '+39 ' + areaCode + ' ' + subscriber;
                     }
 
                     // German mobile: starts with 015, 016, 017 (total 11-13)
@@ -2999,10 +3010,14 @@ async function injectHumanScroll(tabId) {
 }
 
 function broadcastProgress() {
-    const elapsed = Date.now() - TURBO_STATE.startTime;
+    // AS-02 FIX (2026-06-10): guard the idle state. With total=0 the old
+    // `(current/0)*100` produced NaN (serialized to null over sendMessage →
+    // UI showed "null%"); with startTime=null `Date.now() - null` produced
+    // an epoch-sized elapsed. Both reachable via pause/resume at idle.
+    const elapsed = TURBO_STATE.startTime ? Date.now() - TURBO_STATE.startTime : 0;
     const current = TURBO_STATE.completedSearches;
     const total = TURBO_STATE.totalSearches;
-    const percent = Math.round((current / total) * 100);
+    const percent = total > 0 ? Math.round((current / total) * 100) : 0;
 
     const avgTime = current > 0 ? elapsed / current : 2000;
     const remaining = (total - current) * avgTime;
@@ -3164,6 +3179,18 @@ async function finishTurbo() {
         }
     }).catch(() => { });
 
+    // AS-01 FIX (2026-06-10): sweep orphan windows BEFORE resetTurboState()
+    // wipes openTabs (losing the IDs forever — the pre-fix bug: after a run
+    // finished on its own, leftover popups could never be closed, not even by
+    // Stop). No-op in the common case (per-batch cleanupTabs already closed
+    // and untracked everything); only fires when an eviction mid-run left
+    // ledger entries behind.
+    try {
+        await _closeOrphanWindows('TURBO finalize');
+    } catch (e) {
+        console.warn('[TURBO finalize] orphan sweep failed:', e instanceof Error ? e.message : String(e));
+    }
+
     // CRITICAL: Reset state to prevent memory leaks
     resetTurboState();
 }
@@ -3205,8 +3232,14 @@ async function getCoords(city) {
         const resp = await fetch(
             `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&addressdetails=1&limit=10`,
             {
+                // AS-03 FIX (2026-06-10): the custom User-Agent header was
+                // removed — UA is a forbidden header for browser fetch();
+                // Chrome silently dropped it and sent the browser UA anyway,
+                // so it only SIMULATED Nominatim-policy compliance. Real
+                // mitigation is the call pattern itself: single request per
+                // search start, 13-city hardcoded allow-list fast path,
+                // runtime cache, "lat,lon" bypass, concurrent starts blocked.
                 headers: {
-                    'User-Agent': 'GhostMapPro/9.0 (contact@ghostmappro.com)',
                     'Accept-Language': 'en-US,en;q=0.9'
                 }
             }
@@ -3318,8 +3351,92 @@ function sleep(ms) {
 }
 
 // Control
-function pauseTurbo() { TURBO_STATE.isPaused = true; broadcastProgress(); return { status: 'paused' }; }
-function resumeTurbo() { TURBO_STATE.isPaused = false; broadcastProgress(); return { status: 'resumed' }; }
+// AS-02 FIX (2026-06-10): state-machine guard — pause/resume are only valid
+// transitions while a run is active. At idle they used to mutate isPaused and
+// fire a spurious progress broadcast (the NaN-percent path). The only UI
+// consumer (area-search-modal handlePause) ignores the response shape, so the
+// early-return is contract-safe.
+function pauseTurbo() {
+    if (!TURBO_STATE.isRunning) return { status: 'idle' };
+    TURBO_STATE.isPaused = true; broadcastProgress(); return { status: 'paused' };
+}
+function resumeTurbo() {
+    if (!TURBO_STATE.isRunning) return { status: 'idle' };
+    TURBO_STATE.isPaused = false; broadcastProgress(); return { status: 'resumed' };
+}
+
+/**
+ * AS-01 FIX (2026-06-10): close every window/tab this extension created and
+ * still tracks — the in-memory `openTabs` Set AND the session-storage
+ * marker-based ledger (B3-3). Extracted from stopTurbo so ALL lifecycle
+ * boundaries share the same idempotent, mutex-protected sweep:
+ *   • stopTurbo            — user-initiated stop (pre-existing behavior)
+ *   • eviction respawn     — popups of the interrupted batch are by definition
+ *                            orphans (the loop that owned them died with the
+ *                            SW); close them BEFORE the redo creates new ones
+ *   • finishTurbo          — natural completion sweeps any leftovers before
+ *                            resetTurboState() wipes openTabs (which would
+ *                            lose the IDs forever — the pre-fix bug)
+ * Idempotent: per-window try/catch, ledger no-op when empty (the common case).
+ *
+ * NOTE (deliberate non-fix): the interrupted batch is REDONE, not skipped —
+ * `currentBatch` only advances in the batch `finally`, and the CID-keyed
+ * fill-holes merge makes the redo idempotent on data. A persisted
+ * "batch-in-progress skip" marker would trade correctness (losing the
+ * un-extracted tail of that batch) for speed on a rare event. The window
+ * ledger already persists everything needed to undo the visible damage.
+ *
+ * @param {string} label - log prefix identifying the calling boundary
+ * @returns {Promise<void>}
+ */
+async function _closeOrphanWindows(label) {
+    await tabCleanupMutex.runExclusive(async () => {
+        // STEP 1: Close tracked tabs first (fast path)
+        if (TURBO_STATE.openTabs.size > 0) {
+            console.log(`[${label}] 🧹 Closing ${TURBO_STATE.openTabs.size} tracked tabs`);
+            for (const tabId of TURBO_STATE.openTabs) {
+                try {
+                    await chrome.tabs.remove(tabId);
+                } catch (e) {
+                    // Tab may have been closed already
+                }
+            }
+            TURBO_STATE.openTabs.clear();
+            _schedulePersist();  // B3-1: Set mutation doesn't trigger Proxy set; persist explicitly
+        }
+
+        // STEP 2: Marker-based fallback (B3-3 P0 fix)
+        // ─────────────────────────────────────────────────────────────────────
+        // Read the session-storage ledger of windows WE created and tagged
+        // with our session marker. Close ONLY those — never the user's own
+        // Maps tabs. If the ledger is empty, do nothing (safer than
+        // overreaching; see B3-3 history for the chrome.tabs.query({}) abuse).
+        try {
+            const trackedIds = await _getTrackedWindowIds();
+            if (trackedIds.length > 0) {
+                console.log(`[${label}] 🧹 Closing ${trackedIds.length} marker-tracked windows (NOT user tabs)`);
+                for (const wId of trackedIds) {
+                    try {
+                        await chrome.windows.remove(wId);
+                    } catch (e) {
+                        // Window may already be closed; logging only
+                        const msg = e instanceof Error ? e.message : String(e);
+                        console.warn(`[CLEANUP] Failed to close window ${wId}:`, msg);
+                    }
+                }
+                // Wipe the ledger — all our tracked windows are now closed (or gone)
+                try { await chrome.storage.session.remove(_TRACKED_WINDOWS_KEY); } catch (_) { /* ignore */ }
+                console.log(`[${label}] ✓ Tracked-window cleanup complete`);
+            } else {
+                console.log(`[${label}] No tracked windows in ledger — sweep no-op (user tabs preserved)`);
+            }
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[${label}] Marker-based cleanup failed:`, msg);
+        }
+    });
+}
+
 async function stopTurbo() {
     TURBO_STATE.isRunning = false;
 
@@ -3334,55 +3451,8 @@ async function stopTurbo() {
     }
 
     // BGW-H3 FIX: Mutex-protected tab cleanup to prevent race conditions
-    await tabCleanupMutex.runExclusive(async () => {
-        // STEP 1: Close tracked tabs first (fast path)
-        if (TURBO_STATE.openTabs.size > 0) {
-            console.log(`[BGW-H3] 🧹 Closing ${TURBO_STATE.openTabs.size} tracked tabs`);
-            for (const tabId of TURBO_STATE.openTabs) {
-                try {
-                    await chrome.tabs.remove(tabId);
-                } catch (e) {
-                    // Tab may have been closed already
-                }
-            }
-            TURBO_STATE.openTabs.clear();
-            _schedulePersist();  // B3-1: Set mutation doesn't trigger Proxy set; persist explicitly
-        }
-
-        // STEP 2: Marker-based emergency fallback (B3-3 P0 fix)
-        // ─────────────────────────────────────────────────────────────────────
-        // Pre-fix: this fallback queried `chrome.tabs.query({})` and closed
-        // ALL Google-Maps tabs except the active one. Destructive UX: the
-        // user's own Maps tabs (research, multi-tab nav) were silently killed
-        // when `TURBO_STATE.openTabs` was empty (e.g. after SW eviction).
-        //
-        // Fix: read the session-storage ledger of windows WE created and tagged
-        // with our session marker. Close ONLY those. If the ledger is empty,
-        // do nothing (safer than overreaching).
-        try {
-            const trackedIds = await _getTrackedWindowIds();
-            if (trackedIds.length > 0) {
-                console.log(`[BGW-H3] 🧹 FALLBACK: Closing ${trackedIds.length} marker-tracked windows (NOT user tabs)`);
-                for (const wId of trackedIds) {
-                    try {
-                        await chrome.windows.remove(wId);
-                    } catch (e) {
-                        // Window may already be closed; logging only
-                        const msg = e instanceof Error ? e.message : String(e);
-                        console.warn(`[CLEANUP] Failed to close window ${wId}:`, msg);
-                    }
-                }
-                // Wipe the ledger — all our tracked windows are now closed (or gone)
-                try { await chrome.storage.session.remove(_TRACKED_WINDOWS_KEY); } catch (_) { /* ignore */ }
-                console.log(`[BGW-H3] ✓ Emergency cleanup complete`);
-            } else {
-                console.log(`[BGW-H3] No tracked windows in ledger — fallback no-op (user tabs preserved)`);
-            }
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.error('[BGW-H3] Marker-based cleanup failed:', msg);
-        }
-    });
+    // AS-01: shared sweep helper (was inlined here pre-fix; behavior identical)
+    await _closeOrphanWindows('BGW-H3');
 
     // FIX H-002: Clear all area-search owned timers to prevent memory leaks
     const timerRegistry = getTimerRegistry();
@@ -3425,6 +3495,9 @@ export { startTurboV3, pauseTurbo, resumeTurbo, stopTurbo, getTurboStatus, setSa
 // v9.11: Exported for unit tests in tests/area_search_detail_drain.test.js.
 // These are NOT part of the public API — internal helpers used by runTurboV3.
 export { _wakeObserversInTabs, _waitForDetailFetcherIdle, _collectDetailFetcherStats };
+// AS-01 (2026-06-10): exported for tests/run-area-search-orphan-cleanup-as01-node.mjs.
+// Internal lifecycle-boundary sweep — NOT public API.
+export { _closeOrphanWindows };
 // fix-area-search-wrong-center (01-01): pure, rank-preserving Nominatim
 // settlement selection. Exported for tests/run-area-search-geocode-node.mjs.
 export { selectGeocodeResult };

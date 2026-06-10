@@ -420,15 +420,21 @@ async function retryFailedFromModal() {
         // USE NEW DATABASE-BASED RETRY (works for businesses with no email found)
         const response = await chrome.runtime.sendMessage({ action: 'retry_failed_businesses' });
 
-        if (response && response.status === 'retrying') {
-            alert(`✅ Retrying ${response.count} failed businesses! Check the main panel for progress.`);
+        // UI-01 FIX (2026-06-09): the retry_failed_businesses handler returns
+        // { success, count } / { noFailed } / { success:false, error } — NOT a
+        // `status` field (that was the shape of the deprecated retry_failed_jobs).
+        // The modal previously matched none of these and always showed a false
+        // "Could not start retry" error even though the retry HAD started.
+        // Aligned with ui/sidepanel.js:723-731 (the correct consumer).
+        if (response?.success) {
+            alert(`✅ Retrying ${response.count ?? ''} failed businesses! Check the main panel for progress.`);
             closeFailedModal();
 
             // Refresh stats in main panel if function exists
             if (typeof refreshStats === 'function') {
                 refreshStats();
             }
-        } else if (response && response.status === 'no_targets') {
+        } else if (response?.noFailed) {
             alert('No failed businesses to retry.');
         } else {
             alert('Error: ' + (response?.error || 'Could not start retry'));

@@ -19,7 +19,6 @@
   ],
   "host_permissions": [
     "https://www.google.com/maps/*",
-    "http://*/*",
     "https://*/*"
   ],
   "background": {
@@ -61,15 +60,8 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": [
-        "assets/*"
-      ],
-      "matches": [
-        "<all_urls>"
-      ]
-    },
-    {
       "_comment_co_8": "CO-8 FIX (2026-05-10): content/gmb/*.js and lib/*.js are the watcher scripts injected by observer.js's R-STATE FALLBACK path. Pre-fix they were exposed to <all_urls>, which meant ANY website could <script src='chrome-extension://[EXTENSION_ID]/content/gmb/maps-state-watcher.js'> and (a) execute the watcher in its own page context, (b) use script.onload as a binary oracle to fingerprint extension users + leak the EXTENSION_ID. Now restricted to Google Maps origins, the only legitimate consumer. The fallback path in observer.js:295 still works because it injects only into Maps pages.",
+      "_comment_war_01": "WAR-01 FIX (2026-06-09): the dead `assets/*` on <all_urls> block was removed — the assets/ directory does not exist (verified), so it was dead config and a future foot-gun. The `*.js` globs are deliberately NOT narrowed to an explicit file list: content/gmb/loader.js does `import(chrome.runtime.getURL('content/gmb/index.js'))`, so the ENTIRE transitive ES-module graph reachable from index.js (observer.js → lib/config, lib/utils, lib/SelectorEngine, lib/sanitize, lib/phone-normalizer, …) must stay web-accessible or the content script 404s and dies on Maps. Narrowing to a fixed enumeration requires a Chrome-runtime-verified module-graph trace (load unpacked, exercise primary + R-STATE fallback, confirm no chrome-extension:// 404s); deferred to avoid a silent extension-wide break for an exposure already origin-restricted to Google.",
       "resources": [
         "content/gmb/*.js",
         "lib/*.js"

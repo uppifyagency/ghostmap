@@ -229,7 +229,11 @@ async function refreshStorageDetails() {
         // ui/messaging.js so this call rejects after 15s instead of
         // hanging the modal forever if the SW is evicted mid-call.
         const statsResponse = await window.sendMessageWithTimeout({ action: 'get_stats' });
-        const stats = statsResponse?.stats || {};
+        // UI-02 FIX (2026-06-09): get_stats returns the FLAT getStatsWithQueue()
+        // object (the sidepanel consumes stats.total directly). There is no
+        // `.stats` wrapper, so `statsResponse?.stats` was always {} and the modal
+        // showed "0 records / ~0.00 MB" regardless of actual DB contents.
+        const stats = statsResponse || {};
 
         // ═══════════════════════════════════════════════════════════════════════════════
         // UI-009 FIX: Estimate IndexedDB size with documented calculation

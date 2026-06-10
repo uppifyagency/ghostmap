@@ -40,7 +40,13 @@ export class JobQueue {
 
     constructor(options = {}) {
         this.queue = [];
-        this.activeJobs = new Set();
+        // JQ-01 FIX (2026-06-09): Map<jobId, job>, not Set<jobId>. saveQueue()
+        // serializes union(activeJobs, queue) via `this.activeJobs.values()` and
+        // filters by `job.persistable && job.type` — when this held bare id
+        // strings the filter dropped every entry, so in-flight jobs were never
+        // persisted and a browser crash/restart lost them (the whole
+        // union-persist block was dead code). Storing the job object makes it live.
+        this.activeJobs = new Map();
         this.failedJobs = [];
         this.mutex = new Mutex();
         // BUG-023 FIX: Validate test mode is only used in test environments
@@ -615,7 +621,8 @@ export class JobQueue {
 
                     // FIX: Track job in activeJobs SYNCHRONOUSLY before async execution
                     // This prevents race condition where queue reports empty before job starts
-                    this.activeJobs.add(job.id);
+                    // JQ-01: store the job OBJECT (keyed by id) so saveQueue() can serialize it.
+                    this.activeJobs.set(job.id, job);
 
                     // B6-1: Persist active job to chrome.storage.session so it survives
                     // SW eviction. Fire-and-forget (non-blocking); _executeJob proceeds.

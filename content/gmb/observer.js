@@ -495,6 +495,19 @@ export class DOMObserver {
                 if (result.fields.website) fields.website = result.fields.website;
                 if (result.fields.address) fields.address = result.fields.address;
                 if (result.fields.rating != null) fields.rating = result.fields.rating;
+                // EXP-01 FIX (2026-06-10): propagate the card-URL coordinates
+                // (already parsed into `ids` and REQUIRED by the detail-fetch
+                // payload) into the enrichment. Pre-fix only the JSPB state
+                // catalog populated latitude/longitude (~21% of rows), so the
+                // export radius filter ran fail-open on the other ~79%. Named
+                // latitude/longitude to match the record schema consumed by
+                // data-exporter's DISCARD_OUT_OF_RADIUS. Added BEFORE the
+                // empty-check on purpose: a coords-only enrichment is now
+                // worth shipping — closing that coverage gap is the point.
+                if (Number.isFinite(ids.lat) && Number.isFinite(ids.lng)) {
+                    fields.latitude = ids.lat;
+                    fields.longitude = ids.lng;
+                }
                 if (Object.keys(fields).length === 0) {
                     logger.info(`[R-DETAIL-FETCH] empty fields for ${business.title?.slice(0,40)}`);
                     return;
@@ -685,7 +698,7 @@ export class DOMObserver {
             let phoneNormalized = null;
             if (fields.phone) {
                 if (isValidPhone(fields.phone)) {
-                    phoneNormalized = normalizePhone(fields.phone);
+                    phoneNormalized = normalizePhone(fields.phone, { country: 'IT' });
                 } else {
                     logger.debug(`[R-DETAIL] phone "${fields.phone}" rejected by isValidPhone`);
                 }
@@ -714,6 +727,18 @@ export class DOMObserver {
                     phone: stringPart.phone
                 }
             };
+            // EXP-01 FIX (2026-06-10): best-effort coordinates from the
+            // detail-panel URL (!8m2!3d<lat>!4d<lng>). Added AFTER the
+            // "panel not populated" gate above — URL-derived coords must
+            // never satisfy that gate, or the defer-retry would be skipped
+            // and the real panel fields lost.
+            try {
+                const urlIds = this._idsFromUrl(window.location.href);
+                if (urlIds && Number.isFinite(urlIds.lat) && Number.isFinite(urlIds.lng)) {
+                    payload.fields.latitude = urlIds.lat;
+                    payload.fields.longitude = urlIds.lng;
+                }
+            } catch { /* coords are opportunistic — never block the enrichment */ }
 
             chrome.runtime.sendMessage(
                 { action: 'business_enrichment', payload },
@@ -1112,11 +1137,11 @@ export class DOMObserver {
                 if (Array.isArray(business.phone)) {
                     const validPhones = business.phone
                         .filter(p => isValidPhone(p))
-                        .map(p => normalizePhone(p));
+                        .map(p => normalizePhone(p, { country: 'IT' }));
                     business.phone = [...new Set(validPhones)].join(' / ');
                 } else {
                     if (isValidPhone(business.phone)) {
-                        business.phone = normalizePhone(business.phone);
+                        business.phone = normalizePhone(business.phone, { country: 'IT' });
                     } else {
                         business.phone = null;
                     }
@@ -1238,7 +1263,7 @@ export class DOMObserver {
             if (match) {
                 const phone = match[0];
                 if (isValidPhone(phone)) {
-                    return normalizePhone(phone);
+                    return normalizePhone(phone, { country: 'IT' });
                 }
             }
         }
