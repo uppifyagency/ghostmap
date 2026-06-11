@@ -25,10 +25,28 @@
 import { CONFIG } from '../lib/config.js';
 import { extractPartitaIva } from '../lib/partitaIva.js';
 import { logger, sleep } from '../lib/utils.js';
-import { getSessionPool } from '../lib/SessionPool.js';
 import { getStatistics } from '../lib/Statistics.js';
-// HIGH-003 FIX: Import circuit breaker from email-scraper-v2
-import emailScraper from './email-scraper-v2.js';
+// §3.D.3 CYCLE BREAK (2026-06-11): this module must NOT import the
+// orchestrator (email-scraper-v2) back — that was the only import cycle in
+// the codebase (flagged by eslint import/no-cycle). The HIGH-003 circuit
+// check is now received via injection: email-scraper-v2 calls
+// setCircuitHooks() at module-eval time (it is this module's only importer),
+// so in production the hooks are always live before scrapeWithTab runs.
+// The fail-open defaults only apply if this module is loaded standalone
+// (e.g. a test harness) — same observable behavior as the pre-fix `?.`
+// optional call.
+let _circuit = {
+    isCircuitOpen: async () => false,
+    recordCircuitFailure: async () => {},
+};
+
+/**
+ * Inject the per-domain circuit-breaker hooks. Called by email-scraper-v2.
+ * @param {{isCircuitOpen?: Function, recordCircuitFailure?: Function}} hooks
+ */
+export function setCircuitHooks(hooks = {}) {
+    _circuit = { ..._circuit, ...hooks };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -85,8 +103,14 @@ const RETRY_ELIGIBLE_ERRORS = [
     'captcha'
 ];
 
-// Get shared singletons
-const sessionPool = getSessionPool();
+// Get shared singletons.
+// Forensic #11 (2026-06-11): the former `const sessionPool = getSessionPool();`
+// here was DEAD (assigned, never referenced in this module) AND was the eager
+// module-load call that won the "first-config-wins" singleton race — creating
+// the pool with DEFAULTS before index.js initialize() could set the
+// authoritative {maxErrorScore:5, maxAgeSecs:1800}. Removed entirely: kills the
+// race and drops dead code in one move. (getStatistics() is genuinely used at
+// line ~773 and carries no comparable tuning config, so it stays.)
 const statistics = getStatistics();
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -569,7 +593,7 @@ export async function scrapeWithTab(business, options = {}) {
     try {
         const url = new URL(business.website.startsWith('http') ? business.website : 'https://' + business.website);
         const domain = url.hostname;
-        if (await emailScraper.isCircuitOpen(domain)) {
+        if (await _circuit.isCircuitOpen(domain)) {
             logger.warn(`[TAB FALLBACK] ⏭️ Skipping - domain ${domain} is circuit-open`);
             return {
                 emails: [],
@@ -647,9 +671,9 @@ export async function scrapeWithTab(business, options = {}) {
                 logger.warn(`[TAB] ⚠️ Site unreachable - Chrome showing error page (${errorPageCheck.reason})`);
                 logger.warn(`[TAB] Recording circuit breaker failure for domain: ${domain}`);
 
-                // Record failure in circuit breaker via imported module
+                // Record failure in circuit breaker via injected hook (§3.D.3)
                 // B4-2: now async (chrome.storage.session-backed)
-                await emailScraper.recordCircuitFailure?.(domain, 'CONNECTION_ERROR');
+                await _circuit.recordCircuitFailure(domain, 'CONNECTION_ERROR');
 
                 return {
                     emails: [],

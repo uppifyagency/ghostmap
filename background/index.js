@@ -93,7 +93,7 @@ export function getEnrichmentTelemetry() {
 
 // CRAWLEE PHASE 3: System Monitor and AutoScaler
 import { initializeSystemMonitor, stopSystemMonitor, getSystemMonitor } from '../lib/SystemMonitor.js';
-import { getAutoScaler } from '../lib/AutoScaler.js';
+import { getAutoScaler, configureAutoScaler } from '../lib/AutoScaler.js';
 import { container } from '../lib/ServiceContainer.js';
 import { robotsCompliance } from '../lib/RobotsCompliance.js';
 import { validateMessageSender } from './message-validator.js';
@@ -383,19 +383,29 @@ async function initialize() {
         });
         logger.info('SystemMonitor started');
 
-        // M8-CONFLICT FIX: Centralized authoritative AutoScaler config
-        // This is the SINGLE SOURCE OF TRUTH for AutoScaler configuration.
-        // All other modules (jobQueue.js, email-scraper-v2.js) must call
-        // getAutoScaler() WITHOUT config options. Conflicting values
-        // (e.g., jobQueue min:2/max:8) will trigger a warning and be ignored.
-        const autoScaler = getAutoScaler({
+        // M8-CONFLICT FIX + Forensic #9 (2026-06-11): Centralized AUTHORITATIVE
+        // AutoScaler config — the SINGLE SOURCE OF TRUTH. configureAutoScaler()
+        // OVERWRITES the live singleton (via reconfigure) regardless of which
+        // eager module-load getAutoScaler() created it first, so the
+        // anti-detection ceiling (max 5) is guaranteed. Pre-fix the eager
+        // no-option call in email-scraper-v2.js won and the scaler silently ran
+        // the constructor defaults (max 10). All other modules call
+        // getAutoScaler() with NO options (pure accessor).
+        const autoScaler = configureAutoScaler({
             minConcurrency: 1,
             maxConcurrency: CONFIG.rateLimits.emailScraping.maxConcurrent || 5,
             desiredConcurrency: 3,
             successRateThresholdUp: 0.85,
             successRateThresholdDown: 0.6
         });
-        logger.info(`AutoScaler initialized: ${autoScaler.toString()}`);
+        // Forensic #10: loadSettings() ran BEFORE this authoritative configure
+        // (it must — rate-limit settings feed jobQueue early), so re-apply the
+        // user's persisted concurrency on top of the design default (desired 3).
+        // jobQueue.maxConcurrent carries the clamped persisted value when set.
+        if (jobQueue && Number.isFinite(jobQueue.maxConcurrent) && jobQueue.maxConcurrent >= 1) {
+            autoScaler.setConcurrency(jobQueue.maxConcurrent);
+        }
+        logger.info(`AutoScaler initialized (authoritative): ${autoScaler.toString()}`);
 
         // CRAWLEE PHASE 3.3: Initialize JobQueue with persistence
         // B6-3: 30000 → 10000. chrome.runtime.onSuspend is "best effort" in
@@ -556,6 +566,14 @@ _initializePromise = initialize().then(
 
 // Inject dependencies (unchanged — runs after init)
 AreaSearch.setSaveHandler(handleBusinessBatch);
+// Forensic #5 (2026-06-11): release the keepalive alarm on EVERY run end
+// (natural completion / saturation / abort / stop). Pre-fix only the manual
+// 'stop_area_search' handler called stopKeepAlive(), so a run that finished
+// on its own left the 30s alarm keeping the SW alive indefinitely.
+AreaSearch.setOnRunFinished((reason) => {
+    logger.info(`[AREA SEARCH] Run finished (${reason}) — releasing keepalive holder`);
+    stopKeepAlive('area-search');
+});
 
 /**
  * Load settings from storage
@@ -565,8 +583,17 @@ async function loadSettings() {
         const { userSettings } = await chrome.storage.local.get(['userSettings']);
 
         if (userSettings && jobQueue) {
-            // Apply settings to job queue
-            if (userSettings.maxConcurrent) jobQueue.maxConcurrent = userSettings.maxConcurrent;
+            // Apply settings to job queue.
+            // Forensic #10 (2026-06-11): also drive the AutoScaler — the run
+            // loop reads autoScaler.getConcurrency(), so without this the
+            // persisted setting was write-only across SW restarts. Clamp 1-5
+            // (authoritative anti-detection ceiling); setConcurrency re-clamps
+            // into the scaler's own [min,max] anyway (defense in depth).
+            if (userSettings.maxConcurrent) {
+                const mc = Math.max(1, Math.min(5, parseInt(userSettings.maxConcurrent) || 1));
+                jobQueue.maxConcurrent = mc;
+                try { getAutoScaler().setConcurrency(mc); } catch { /* scaler not ready: initialize() applies authoritative config */ }
+            }
 
             // Update rate limiting (approximate since we use Gaussian)
             if (userSettings.rateLimit) {
@@ -591,7 +618,7 @@ async function loadSettings() {
 function setupQueueCallbacks() {
     jobQueue.onQueueEmpty = () => {
         logger.info('All email scraping jobs completed');
-        stopKeepAlive(); // Stop keepalive when queue empty
+        stopKeepAlive('email-scraping'); // Stop keepalive when queue empty
         _stopPhase2Heartbeat();  // UX-1: stop progress heartbeat
         broadcastMessage({
             action: 'email_scraping_finished',
@@ -978,9 +1005,15 @@ async function handleMessage(message, sender) {
                 }
 
             case 'update_settings':
-                // P1-002 FIX: Define validation limits to prevent resource exhaustion
+                // P1-002 FIX: Define validation limits to prevent resource exhaustion.
+                // Forensic #10 (2026-06-11): maxConcurrent ceiling lowered 10→5 to
+                // match the authoritative AutoScaler max (anti-detection design
+                // ceiling). The slider used to allow 1-10 while the scaler clamped
+                // to its own range, and — worse — nothing applied the value to the
+                // scaler at all (it was write-only: the run loop reads
+                // autoScaler.getConcurrency(), never jobQueue.maxConcurrent).
                 const SETTINGS_LIMITS = {
-                    maxConcurrent: { min: 1, max: 10 },    // 1-10 concurrent jobs max
+                    maxConcurrent: { min: 1, max: 5 },     // 1-5 concurrent jobs (AutoScaler ceiling)
                     rateLimit: { min: 2, max: 60 },        // 2-60 requests per minute
                     timeout: { min: 5, max: 120 }          // 5-120 seconds
                 };
@@ -998,7 +1031,15 @@ async function handleMessage(message, sender) {
                             logger.warn(`[SETTINGS] maxConcurrent ${mc} clamped to ${validMC} (valid: ${SETTINGS_LIMITS.maxConcurrent.min}-${SETTINGS_LIMITS.maxConcurrent.max})`);
                         }
                         jobQueue.maxConcurrent = validMC;
-                        logger.info(`[SETTINGS] maxConcurrent set to ${jobQueue.maxConcurrent}`);
+                        // Forensic #10: actually DRIVE the live scaler — this is the
+                        // value the run loop reads (autoScaler.getConcurrency()).
+                        // Without this the slider was a no-op that logged "success".
+                        try {
+                            getAutoScaler().setConcurrency(validMC);
+                        } catch (e) {
+                            logger.warn(`[SETTINGS] could not apply maxConcurrent to AutoScaler: ${e?.message || e}`);
+                        }
+                        logger.info(`[SETTINGS] maxConcurrent set to ${jobQueue.maxConcurrent} (AutoScaler desiredConcurrency updated)`);
                     }
 
                     if (s.rateLimit !== undefined && s.rateLimit > 0) {
@@ -1111,7 +1152,7 @@ async function handleMessage(message, sender) {
 
             case 'start_area_search':
                 // P1 FIX: Start keep-alive to prevent SW termination during long sessions
-                startKeepAlive();
+                startKeepAlive('area-search');
                 return await AreaSearch.start(payload);
 
             case 'pause_area_search':
@@ -1122,7 +1163,7 @@ async function handleMessage(message, sender) {
 
             case 'stop_area_search':
                 // P1 FIX: Stop keep-alive when area search ends
-                stopKeepAlive();
+                stopKeepAlive('area-search');
                 return await AreaSearch.stop();
 
             case 'get_area_search_status':
@@ -1590,14 +1631,22 @@ async function _doEnrichmentMerge(existing, fields, dbKey) {
     }
     // v9.12 Wave 1.1 (2026-05-08): reviewCount captured by anchor-based rating
     // regex, paired with rating in pb (rating,reviewCount tuple).
-    if ((merged.reviewCount == null || merged.reviewCount === '') && f.reviewCount != null) {
+    // DEBT-CSV-1 (2026-06-11): now reachable (observer forwards the field).
+    // Type-validated like EXP-01 lat/lng above — same trust boundary (the
+    // MAIN-world postMessage bridge is page-forgeable, and reviewCount lands
+    // UNESCAPED in the CSV Reviews cell, so a non-numeric value would be a
+    // formula-injection vector).
+    if ((merged.reviewCount == null || merged.reviewCount === '') && f.reviewCount != null
+        && typeof f.reviewCount === 'number' && Number.isFinite(f.reviewCount) && f.reviewCount >= 0) {
         merged.reviewCount = f.reviewCount;
     }
     // v9.12 Wave 1: hours raw from /maps/preview/place pb response. Telemetry
     // tracks parse hit rate so smoke run reveals if the regex pattern matches
     // real Maps responses (PROVISIONAL — see content/gmb/detail-fetcher.js).
+    // hoursRaw needs no type guard here: the CSV cell goes through escapeCsv.
     if (!merged.hoursRaw && f.hoursRaw) merged.hoursRaw = f.hoursRaw;
-    if (merged.hoursDaysFound == null && f.hoursDaysFound != null) {
+    if (merged.hoursDaysFound == null && f.hoursDaysFound != null
+        && typeof f.hoursDaysFound === 'number' && Number.isFinite(f.hoursDaysFound)) {
         merged.hoursDaysFound = f.hoursDaysFound;
     }
     if (f.hoursRaw) {
@@ -1721,7 +1770,7 @@ async function startEmailScraping() {
         });
 
         // Start keepalive
-        startKeepAlive();
+        startKeepAlive('email-scraping');
 
         // BUG-FIX: Setup offscreen document BEFORE adding jobs
         // Previously this was fire-and-forget with .catch(), causing race condition
@@ -1855,7 +1904,7 @@ function stopEmailScraping() {
     // M2-RACE1 FIX: Request cancellation so addJobsInBatches stops between batches
     jobQueue.requestCancellation();
     jobQueue.pause();
-    stopKeepAlive();
+    stopKeepAlive('email-scraping');
     _stopPhase2Heartbeat();  // UX-1: stop heartbeat on user-requested pause
     logger.info('Email scraping paused');
     return { status: 'paused' };
@@ -2373,19 +2422,28 @@ async function factoryReset() {
             // FIX: Reset isPaused flag so new jobs can auto-start after reset
             jobQueue.isPaused = false;
         }
-        stopKeepAlive();
+        stopKeepAliveAll();
 
-        // Step 2: Clear businesses from database first
+        // Step 2: Clear businesses from database first.
+        // Forensic #19: track the outcome instead of swallowing it into a
+        // blanket "success". Data is considered cleared if EITHER the row clear
+        // OR the DB delete (step 3) confirms — but if BOTH fail, the user must
+        // be told the reset was incomplete.
         logger.info('[RESET] Step 2: Clearing businesses...');
+        let clearedBusinesses = false;
         try {
             await clearAllBusinesses();
+            clearedBusinesses = true;
         } catch (e) {
             logger.warn('Could not clear businesses:', e.message);
         }
 
         // Step 3: Delete the IndexedDB database completely
         logger.info('[RESET] Step 3: Deleting IndexedDB...');
-        await deleteIndexedDB();
+        const dbDeleteResult = await deleteIndexedDB();
+        if (!dbDeleteResult.ok) {
+            logger.warn(`[RESET] IndexedDB delete incomplete: ${JSON.stringify({ failed: dbDeleteResult.failed, blocked: dbDeleteResult.blocked, timedOut: dbDeleteResult.timedOut })}`);
+        }
 
         // Step 4: Clear chrome.storage.local
         logger.info('[RESET] Step 4: Clearing chrome.storage.local...');
@@ -2459,6 +2517,26 @@ async function factoryReset() {
             logger.warn('Could not reinitialize DB:', e.message);
         }
 
+        // Forensic #19: honest outcome. The DB is cleared if the row-clear
+        // succeeded OR the IndexedDB delete confirmed ok. If BOTH failed (e.g.
+        // the DB is open in another Maps tab → delete BLOCKED), the data may
+        // have survived and we must NOT claim "fresh". Storage clears (steps
+        // 4-8) ran regardless, so only the business DB is in question.
+        const dataCleared = clearedBusinesses || dbDeleteResult.ok;
+
+        if (!dataCleared) {
+            logger.error('[RESET] ⚠️ INCOMPLETE: business database could not be confirmed cleared (clear failed AND delete failed/blocked)');
+            broadcastMessage({
+                action: 'reset_complete',
+                payload: { timestamp: Date.now(), partial: true }
+            });
+            return {
+                status: 'partial',
+                message: 'Reset incomplete: the database could not be confirmed cleared — it may be open in another Ghost Map tab. Close other tabs and retry.',
+                details: { clearedBusinesses, dbDelete: dbDeleteResult }
+            };
+        }
+
         logger.info('✅ FACTORY RESET COMPLETE - Extension is now fresh!');
 
         // Broadcast reset complete
@@ -2487,8 +2565,22 @@ async function factoryReset() {
 /**
  * Delete IndexedDB database completely
  */
+/**
+ * Delete the IndexedDB database(s).
+ *
+ * Forensic #19 (2026-06-11): this used to resolve() on EVERY path (onsuccess,
+ * onerror, the catch, and the 1s timeout) and the `reject` parameter was never
+ * called — so a delete that failed or was BLOCKED (another tab holding the
+ * connection) was invisible, and factoryReset reported "success" while the data
+ * survived. Worse, `onblocked` did not increment the completion counter, so a
+ * blocked delete could only settle via the timeout. Now we ALWAYS settle (no
+ * hang — that property is deliberate) but resolve with an HONEST result so the
+ * caller can tell the user whether the database was really gone.
+ *
+ * @returns {Promise<{ok: boolean, deleted: string[], failed: string[], blocked: string[], timedOut: boolean}>}
+ */
 async function deleteIndexedDB() {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         // Possible database names to try
         const possibleNames = [
             'GhostMapDB',
@@ -2505,8 +2597,24 @@ async function deleteIndexedDB() {
                 possibleNames.push('GhostMapDB_' + result.dbId);
             }
 
+            const deleted = [];
+            const failed = [];
+            const blocked = [];
             let completedCount = 0;
             const expectedCount = possibleNames.length;
+            let settled = false;
+
+            const finish = (timedOut) => {
+                if (settled) return;
+                settled = true;
+                // ok ONLY when every delete succeeded — a block (DB still open
+                // elsewhere) or an error means data may have survived.
+                const ok = failed.length === 0 && blocked.length === 0 && !timedOut;
+                logger.info(`IndexedDB cleanup: ${deleted.length} deleted, ${failed.length} failed, ${blocked.length} blocked${timedOut ? ', TIMED OUT' : ''}`);
+                resolve({ ok, deleted, failed, blocked, timedOut: !!timedOut });
+            };
+
+            if (expectedCount === 0) { finish(false); return; }
 
             // Try to delete all possible database names
             possibleNames.forEach(name => {
@@ -2515,41 +2623,37 @@ async function deleteIndexedDB() {
 
                     deleteRequest.onsuccess = () => {
                         logger.info(`✅ Deleted IndexedDB: ${name}`);
-                        completedCount++;
-                        if (completedCount >= expectedCount) {
-                            resolve();
-                        }
+                        deleted.push(name);
+                        if (++completedCount >= expectedCount) finish(false);
                     };
 
                     deleteRequest.onerror = (event) => {
                         logger.warn(`Could not delete ${name}:`, event.target?.error);
-                        completedCount++;
-                        if (completedCount >= expectedCount) {
-                            resolve();
-                        }
+                        failed.push(name);
+                        if (++completedCount >= expectedCount) finish(false);
                     };
 
                     deleteRequest.onblocked = () => {
-                        logger.warn(`Database ${name} delete blocked`);
-                        // Try again after a delay
-                        setTimeout(() => {
-                            indexedDB.deleteDatabase(name);
-                        }, 100);
+                        // Blocked = another connection is open; the delete did NOT
+                        // complete. Best-effort retry, but record it as a non-ok
+                        // outcome and COUNT it so finish() fires deterministically
+                        // (pre-fix onblocked never incremented → settled only via
+                        // the timeout).
+                        logger.warn(`Database ${name} delete blocked (open elsewhere)`);
+                        blocked.push(name);
+                        setTimeout(() => { try { indexedDB.deleteDatabase(name); } catch { /* best-effort */ } }, 100);
+                        if (++completedCount >= expectedCount) finish(false);
                     };
                 } catch (e) {
                     logger.warn(`Error deleting ${name}:`, e);
-                    completedCount++;
-                    if (completedCount >= expectedCount) {
-                        resolve();
-                    }
+                    failed.push(name);
+                    if (++completedCount >= expectedCount) finish(false);
                 }
             });
 
-            // Timeout fallback
-            setTimeout(() => {
-                logger.info(`IndexedDB cleanup completed: ${completedCount}/${expectedCount}`);
-                resolve();
-            }, 1000);
+            // Timeout fallback — a request that never fires any handler still
+            // settles here, reported as timedOut (→ ok:false).
+            setTimeout(() => finish(true), 1000);
         });
     });
 }
@@ -2753,7 +2857,18 @@ function broadcastMessage(message) {
 //
 // Reference: docs/HANDOFF_ULTRAREVIEW_BLOCKS.md Block 1 §B1-1
 // ═══════════════════════════════════════════════════════════════════════════
-function startKeepAlive() {
+// Forensic #5 adversarial follow-up (2026-06-11): the single 'keepalive'
+// alarm is SHARED by two independent flows (email scraping and area search).
+// Pre-fix, any stop site cleared the alarm unconditionally, so e.g. an area
+// search finishing killed the keepalive of an email-scraping run still in
+// flight (and vice versa via onQueueEmpty). Holder refcount: the alarm is
+// cleared only when NO flow holds it. In-memory is fine — if the SW is
+// evicted the set resets, but the next stop from any flow still clears the
+// (persisted) alarm, which is the pre-existing best-effort behavior.
+const _keepAliveHolders = new Set();
+
+function startKeepAlive(holder) {
+    _keepAliveHolders.add(holder || 'default');
     // B1-1 fix: 0.5min = 30s, the documented MV3 minimum.
     // delayInMinutes ensures first fire enters the safety window;
     // without it the first tick would be 30s out, racing with eviction.
@@ -2761,16 +2876,28 @@ function startKeepAlive() {
         delayInMinutes: 0.5,
         periodInMinutes: 0.5
     });
-    logger.debug('[KEEPALIVE] Started: delay 30s, period 30s');
+    logger.debug(`[KEEPALIVE] Started (holder: ${holder || 'default'}; active: ${[..._keepAliveHolders].join(',')})`);
 
     // Immediate platform-info call resets the SW idle timer right now —
     // documented Chrome behavior, doesn't rely on undocumented sendMessage hack.
     chrome.runtime.getPlatformInfo().catch(() => { });
 }
 
-function stopKeepAlive() {
+function stopKeepAlive(holder) {
+    _keepAliveHolders.delete(holder || 'default');
+    if (_keepAliveHolders.size > 0) {
+        logger.debug(`[KEEPALIVE] Holder '${holder || 'default'}' released; still held by: ${[..._keepAliveHolders].join(',')}`);
+        return;
+    }
     chrome.alarms.clear('keepalive');
-    logger.debug('[KEEPALIVE] Stopped');
+    logger.debug('[KEEPALIVE] Stopped (no holders left)');
+}
+
+// Factory reset / global teardown: drop every holder and clear the alarm.
+function stopKeepAliveAll() {
+    _keepAliveHolders.clear();
+    chrome.alarms.clear('keepalive');
+    logger.debug('[KEEPALIVE] Stopped (all holders cleared)');
 }
 
 // Listen for keepalive alarm. On each tick, call chrome.runtime.getPlatformInfo()

@@ -59,17 +59,16 @@ export class JobQueue {
         }
 
         // Configuration
-        // PHASE 2: AutoScaler integration for dynamic concurrency control
-        const initialConcurrent = options.maxConcurrent || CONFIG.rateLimits.emailScraping.maxConcurrent;
-        this.autoScaler = getAutoScaler({
-            minConcurrency: 2,
-            maxConcurrency: 8,
-            desiredConcurrency: initialConcurrent,
-            scaleUpIntervalMs: 15000,      // 15s between scale ups
-            scaleDownIntervalMs: 5000,     // 5s between scale downs
-            successRateThresholdUp: 0.85,  // Scale up at 85%+ success
-            successRateThresholdDown: 0.6  // Scale down below 60%
-        });
+        // PHASE 2: AutoScaler integration for dynamic concurrency control.
+        // Forensic #9 (2026-06-11): use the PURE accessor. The authoritative
+        // config (min1/max5/desired3) is set once by index.js initialize() via
+        // configureAutoScaler(). Pre-fix this constructor passed min2/max8 — but
+        // it was silently ignored anyway (an eager no-option getAutoScaler() in
+        // email-scraper-v2.js had already created the default instance), so the
+        // live scaler ran defaults (max 10). The run loop reads
+        // autoScaler.getConcurrency() live (see ~:546), so the authoritative
+        // reconfigure that lands during initialize() is honored at runtime.
+        this.autoScaler = getAutoScaler();
         this.maxConcurrent = this.autoScaler.getConcurrency();
 
 
@@ -153,7 +152,12 @@ export class JobQueue {
         this._domainTokenCleanupInterval = setInterval(() => this.cleanupStaleDomainTokens(), 10 * 60 * 1000);
 
         logger.info(`[JobQueue] 🚀 Initialized with Crawlee features: sameDomainDelay=${this.sameDomainDelayMs}ms, backoffMax=${this.backoffMax}ms`);
-        logger.info(`[JobQueue] 🎚️ AutoScaler enabled: min=${2}, max=${8}, initial=${initialConcurrent}`);
+        // Forensic #9 (2026-06-11): read the live scaler instead of the old
+        // hardcoded min=2/max=8 + the now-removed `initialConcurrent` local
+        // (which had become a dangling ReferenceError after the eager-config
+        // removal — it crashed real-module import in probe_audit). The
+        // authoritative config is applied by index.js configureAutoScaler().
+        logger.info(`[JobQueue] 🎚️ AutoScaler enabled: min=${this.autoScaler.options.minConcurrency}, max=${this.autoScaler.options.maxConcurrency}, initial=${this.autoScaler.getConcurrency()}`);
     }
 
     /**

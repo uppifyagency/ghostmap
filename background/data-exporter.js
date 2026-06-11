@@ -10,8 +10,7 @@
  */
 
 import { getBusinesses } from '../lib/db.js';
-import { escapeCsv } from '../lib/utils.js';
-import { logger } from '../lib/utils.js';
+import { escapeCsv, logger } from '../lib/utils.js';
 import { normalizePhone, formatPhoneForCsv, formatPartitaIvaForCsv } from '../lib/phone-normalizer.js';
 import { CONFIG } from '../lib/config.js';
 import { haversineDistance } from '../lib/geo-grid.js';
@@ -357,9 +356,15 @@ export function generateCSV(businesses) {
         b.emailScraped ? (b.email ? 'success' : 'no_email') : 'pending',
         formatPartitaIvaForCsv(b.partitaIva || ''),
         formatPartitaIvaForCsv(b.codiceFiscale || ''),
-        escapeCsv(b.openingHours || ''),
+        // DEBT-CSV-1 (2026-06-11): detail-fetcher back-fill. hoursRaw /
+        // reviewCount carry the same semantics from a different source
+        // (detail-page HTML), so they fall back into the existing columns
+        // instead of adding near-duplicate ones. `??` keeps a card-extracted
+        // 0 from being masked; the trailing || '' preserves the historical
+        // 0/null → empty-cell behavior.
+        escapeCsv(b.openingHours || b.hoursRaw || ''),
         b.rating || '',
-        b.reviews || '',
+        (b.reviews ?? b.reviewCount) || '',
         escapeCsv(b.address),
         escapeCsv(b.social?.facebook),
         escapeCsv(b.social?.instagram),

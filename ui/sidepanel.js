@@ -1179,7 +1179,11 @@ function confirmReset() {
 async function resetAll() {
     showLoading('Resetting all data...');
     try {
-        await sendMessageWithTimeout({ action: 'factory_reset' });
+        // Forensic #19 (2026-06-11): capture the result. Pre-fix this ignored
+        // the response entirely and ALWAYS showed "All data has been reset",
+        // even when the SW reported the DB could not be cleared (open in
+        // another tab). Honor a 'partial' status with a real warning.
+        const resetResponse = await sendMessageWithTimeout({ action: 'factory_reset' });
 
         // Reset state
         state.stats = { total: 0, withEmail: 0, withWebsite: 0, withPhone: 0, queue: 0, failed: 0, successRate: 0, avgTime: null };
@@ -1242,7 +1246,16 @@ async function resetAll() {
         // Clear activities
         renderActivities();
 
-        showToast('All data has been reset', 'success');
+        // Forensic #19: honor the SW's honest status. 'partial' = storage was
+        // cleared but the business DB could not be confirmed wiped (likely open
+        // in another Maps tab) — tell the user instead of claiming success.
+        if (resetResponse?.status === 'partial') {
+            showToast(resetResponse.message || 'Reset incomplete — close other Ghost Map tabs and retry', 'error');
+        } else if (resetResponse?.status === 'error') {
+            showToast('Reset failed — see logs', 'error');
+        } else {
+            showToast('All data has been reset', 'success');
+        }
     } catch (error) {
         console.error('[GhostMap] Reset failed:', error);
         showToast('Reset failed', 'error');

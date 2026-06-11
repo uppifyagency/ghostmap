@@ -295,34 +295,70 @@ export class DOMObserver {
             // R-STATE FALLBACK (2026-05-05): if the manifest-declared MAIN-
             // world content script failed to install (Chrome version, race
             // condition, or extension reload without page refresh), self-
-            // inject the watcher as a `<script src=…>` element. Web-accessible
-            // resources can be loaded as scripts and execute in MAIN world.
+            // inject the MAIN-world scripts as `<script src=…>` elements.
+            // Web-accessible resources load as scripts and execute in MAIN world.
             //
             // We arm a 3-second probe: if the watcher hasn't posted by then,
             // we inject. This makes the integration robust to MV3 quirks.
+            //
+            // Forensic #17 (2026-06-11): inject BOTH manifest MAIN-world scripts,
+            // not just the watcher. The manifest declares maps-state-watcher.js
+            // AND detail-fetcher.js together in one document_start MAIN entry —
+            // if the watcher is silent, the detail-fetcher is missing too. Pre-fix
+            // the fallback re-injected only the watcher, so in the exact scenario
+            // it exists for, every gmp:detail:request died at the observer
+            // timeout (no MAIN-world responder) and phone enrichment was lost.
             this._stateFallbackTimer = setTimeout(() => {
                 if (this._stateBusinessMapSize > 0 || this._stateCidPhoneMapSize > 0) return;
-                try {
-                    const url = chrome.runtime.getURL('content/gmb/maps-state-watcher.js');
-                    const script = document.createElement('script');
-                    script.src = url;
-                    script.onload = () => {
-                        script.remove();
-                        // Re-request a tick now that the watcher is loaded
-                        window.postMessage({ type: 'gmp:state-map-request' }, location.origin);
-                    };
-                    script.onerror = (err) => {
-                        logger.warn(`[R-STATE] fallback inject failed: ${err?.message || err}`);
-                        script.remove();
-                    };
-                    (document.head || document.documentElement).appendChild(script);
-                    logger.info('[R-STATE] manifest watcher silent — injected fallback script');
-                } catch (err) {
-                    logger.debug(`[R-STATE] fallback inject error: ${err?.message}`);
-                }
+                // Inject the watcher; on load, re-request a state tick.
+                this._injectMainWorldScript('content/gmb/maps-state-watcher.js', () => {
+                    window.postMessage({ type: 'gmp:state-map-request' }, location.origin);
+                }, '[R-STATE]');
+                // Forensic #17: also inject the detail-fetcher so gmp:detail:request
+                // has a MAIN-world responder in the fallback path. Injecting it
+                // is harmless even when the detail-fetch feature is off: this
+                // observer only EMITS gmp:detail:request when its own flag check
+                // passes (_maybeFireDetailFetch returns early otherwise), so an
+                // idle responder simply never receives a request. Both MAIN
+                // scripts also self-guard against double-install, so re-injecting
+                // after a late manifest load is a no-op.
+                this._injectMainWorldScript('content/gmb/detail-fetcher.js', null, '[R-DETAIL-FETCH]');
             }, 3000);
         } catch (err) {
             logger.debug(`[R-STATE] listener setup skipped: ${err?.message}`);
+        }
+    }
+
+    /**
+     * Forensic #17 (2026-06-11): inject a web-accessible MAIN-world script as a
+     * `<script src=…>` element (the R-STATE fallback mechanism). Extracted so the
+     * watcher and the detail-fetcher share one code path. The script tag is
+     * removed after load/error; MAIN-world side effects (event listeners, polling)
+     * persist in the page context.
+     * @param {string} relPath - extension-relative path, e.g. 'content/gmb/detail-fetcher.js'
+     * @param {(() => void)|null} onLoaded - optional callback after the script loads
+     * @param {string} [logTag] - log prefix for diagnostics
+     * @private
+     */
+    _injectMainWorldScript(relPath, onLoaded, logTag = '[R-STATE]') {
+        try {
+            const url = chrome.runtime.getURL(relPath);
+            const script = document.createElement('script');
+            script.src = url;
+            script.onload = () => {
+                script.remove();
+                logger.info(`${logTag} manifest script silent — injected fallback: ${relPath}`);
+                if (typeof onLoaded === 'function') {
+                    try { onLoaded(); } catch (err) { logger.debug(`${logTag} onLoaded failed: ${err?.message}`); }
+                }
+            };
+            script.onerror = (err) => {
+                logger.warn(`${logTag} fallback inject failed (${relPath}): ${err?.message || err}`);
+                script.remove();
+            };
+            (document.head || document.documentElement).appendChild(script);
+        } catch (err) {
+            logger.debug(`${logTag} fallback inject error (${relPath}): ${err?.message}`);
         }
     }
 
@@ -488,6 +524,16 @@ export class DOMObserver {
             this.fetchDetailViaNetwork(business.googleMapsUrl).then((result) => {
                 if (!result || !result.ok || !result.fields) {
                     logger.info(`[R-DETAIL-FETCH] no-result for ${business.title?.slice(0,40)}: ok=${result?.ok} status=${result?.status} err=${result?.error}`);
+                    // Forensic #16: a timeout means the fetcher never delivered
+                    // (MAIN scripts not installed, crashed, or queue too deep) —
+                    // NOT a confirmed negative. Drop the attempted-marker so a
+                    // later R-DETAIL trigger (revisit / re-scroll) can retry,
+                    // instead of abandoning the URL forever. A genuine negative
+                    // (ok:false WITH a real status) stays marked — retrying it
+                    // would only repeat the same miss.
+                    if (result?.error === 'timeout' && this._detailFetchAttempted) {
+                        this._detailFetchAttempted.delete(business.googleMapsUrl);
+                    }
                     return;
                 }
                 const fields = {};
@@ -495,6 +541,15 @@ export class DOMObserver {
                 if (result.fields.website) fields.website = result.fields.website;
                 if (result.fields.address) fields.address = result.fields.address;
                 if (result.fields.rating != null) fields.rating = result.fields.rating;
+                // DEBT-CSV-1 FIX (2026-06-11): forward the three fields the
+                // detail-fetcher already extracts but this whitelist used to
+                // drop, killing them at boundary 1. The v9.12 hole-filling
+                // merge in _doEnrichmentMerge (background/index.js) and the
+                // hoursFound/hoursMissing telemetry were built for them and
+                // sat unreachable. Guards mirror the merge's own.
+                if (result.fields.reviewCount != null) fields.reviewCount = result.fields.reviewCount;
+                if (result.fields.hoursRaw) fields.hoursRaw = result.fields.hoursRaw;
+                if (result.fields.hoursDaysFound != null) fields.hoursDaysFound = result.fields.hoursDaysFound;
                 // EXP-01 FIX (2026-06-10): propagate the card-URL coordinates
                 // (already parsed into `ids` and REQUIRED by the detail-fetch
                 // payload) into the enrichment. Pre-fix only the JSPB state
@@ -530,7 +585,19 @@ export class DOMObserver {
         }
     }
 
-    fetchDetailViaNetwork(href, { timeoutMs = 12000, query = 'place' } = {}) {
+    // Forensic #16 (2026-06-11): default raised 12s → 40s to cover the
+    // MAIN-world detail-fetcher's worst case. That fetcher (detail-fetcher.js
+    // CONFIG: maxRetries=2, timeoutMs=10s, backoffBaseMs=2s, jitter≤150ms) takes
+    // up to (2+1)=3 attempts × 10s + backoff (2s + 4s) + jitter ≈ 36.5s, and it
+    // ALWAYS posts gmp:detail:response (success OR failure). Pre-fix the 12s
+    // observer timeout fired FIRST: the listener was removed, so a slow-but-
+    // eventually-successful fetch landed in the void, the URL stayed PERMANENTLY
+    // in _detailFetchAttempted, and the late success even reset the fetcher's
+    // consecutiveFails (masking the loss from the kill-switch). 40s ≈ worst case
+    // + a small margin for a shallow queue at concurrency 3.
+    // NOTE: this timeout is now mainly a backstop for "MAIN scripts not installed"
+    // (the R-STATE fallback, forensic #17) — a live fetcher responds well within it.
+    fetchDetailViaNetwork(href, { timeoutMs = 40000, query = 'place' } = {}) {
         return new Promise((resolve) => {
             const ids = this._idsFromUrl(href);
             if (!ids) { resolve({ ok: false, error: 'href_missing_ids' }); return; }
@@ -579,8 +646,19 @@ export class DOMObserver {
     /**
      * R-DETAIL: install URL change + initial-state hooks.
      * Maps is a SPA — `history.pushState`/`replaceState` mutate the URL
-     * without firing `popstate`. We monkey-patch them once, plus listen
-     * to `popstate`, and finally fire once for the current URL on start.
+     * without firing `popstate`.
+     *
+     * Forensic #2 (2026-06-11): this script runs in the ISOLATED world, so
+     * patching `history` here only intercepted OUR OWN pushState calls (which
+     * never happen) — the page's SPA navigation was invisible and the trigger
+     * was dead for the dominant flow (card click → detail panel). The MAIN-world
+     * watcher (maps-state-watcher.js) already patches the page's real history
+     * and dispatches `gmp:urlchange` on window; DOM events cross isolated-world
+     * boundaries, so we listen to that instead. `popstate` is kept both as the
+     * browser-native back/forward signal and as a degraded path when the MAIN
+     * scripts are not installed. The event carries no data — the trigger only
+     * re-reads location.href (debounced), so a page forging `gmp:urlchange`
+     * gains nothing beyond what forging `popstate` already allowed.
      * @private
      */
     _setupDetailWatcher() {
@@ -588,25 +666,8 @@ export class DOMObserver {
             // Bound trigger so we can remove the listener on stop().
             this._detailTrigger = () => this._onDetailUrlMaybeChanged();
 
-            // History API hooks (idempotent across observer.start/stop cycles)
-            if (!window.__ghostMapHistoryHooked) {
-                const origPush = history.pushState;
-                const origReplace = history.replaceState;
-                history.pushState = function (...args) {
-                    const r = origPush.apply(this, args);
-                    window.dispatchEvent(new Event('ghostmap:locationchange'));
-                    return r;
-                };
-                history.replaceState = function (...args) {
-                    const r = origReplace.apply(this, args);
-                    window.dispatchEvent(new Event('ghostmap:locationchange'));
-                    return r;
-                };
-                window.__ghostMapHistoryHooked = true;
-            }
-
             window.addEventListener('popstate', this._detailTrigger);
-            window.addEventListener('ghostmap:locationchange', this._detailTrigger);
+            window.addEventListener('gmp:urlchange', this._detailTrigger);
 
             // Initial fire (Maps may already be on a /maps/place/X URL)
             this._onDetailUrlMaybeChanged();
@@ -623,7 +684,7 @@ export class DOMObserver {
         try {
             if (this._detailTrigger) {
                 window.removeEventListener('popstate', this._detailTrigger);
-                window.removeEventListener('ghostmap:locationchange', this._detailTrigger);
+                window.removeEventListener('gmp:urlchange', this._detailTrigger);
                 this._detailTrigger = null;
             }
             if (this._detailDebounceTimer) {

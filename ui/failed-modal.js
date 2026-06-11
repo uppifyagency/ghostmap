@@ -430,9 +430,13 @@ async function retryFailedFromModal() {
             alert(`✅ Retrying ${response.count ?? ''} failed businesses! Check the main panel for progress.`);
             closeFailedModal();
 
-            // Refresh stats in main panel if function exists
-            if (typeof refreshStats === 'function') {
-                refreshStats();
+            // Forensic #8b (2026-06-11): this used to call a stats-refresh
+            // function that exists NOWHERE in the repo — the typeof guard
+            // turned it into a silent no-op and the main-panel stats never
+            // refreshed after a retry. The real hook is the sidepanel's
+            // exported facade (sidepanel.js: window.GhostMapUI.loadStats).
+            if (typeof window.GhostMapUI?.loadStats === 'function') {
+                window.GhostMapUI.loadStats();
             }
         } else if (response?.noFailed) {
             alert('No failed businesses to retry.');

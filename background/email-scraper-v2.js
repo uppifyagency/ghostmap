@@ -33,9 +33,17 @@ import { getNavigationHooks } from '../lib/NavigationHooks.js';
 // M3-MISS1: Removed unused createBusinessContext, createPageContext, getContextPool imports
 import { getAutoScaler } from '../lib/AutoScaler.js';
 import { getSystemMonitor } from '../lib/SystemMonitor.js';
-import { scrapeWithTab, shouldRetryWithTab } from './TabScraperFallback.js';
+import { scrapeWithTab, shouldRetryWithTab, setCircuitHooks } from './TabScraperFallback.js';
 import { container } from '../lib/ServiceContainer.js';
 import { robotsCompliance } from '../lib/RobotsCompliance.js';
+
+// §3.D.3 CYCLE BREAK (2026-06-11): inject the per-domain circuit-breaker
+// hooks into TabScraperFallback instead of letting it import this module
+// back (HIGH-003 used to create the only import cycle in the codebase).
+// Function declarations are hoisted, so wiring at module-eval time is safe;
+// this module is TabScraperFallback's only importer, so the hooks are
+// guaranteed live before any scrapeWithTab call.
+setCircuitHooks({ isCircuitOpen, recordCircuitFailure });
 
 // ═══════════════════════════════════════════════════════════════════════════
 // B4-1 P0 FIX: Lazy SessionPool access via DI container
@@ -58,11 +66,21 @@ import { robotsCompliance } from '../lib/RobotsCompliance.js';
 
 // Eager init for singletons WITHOUT storage-restore semantics:
 const navigationHooks = getNavigationHooks();
-const autoScaler = getAutoScaler();
 const systemMonitor = getSystemMonitor();
 
+// Forensic #9 (2026-06-11): AutoScaler is NO LONGER fetched eagerly here.
+// The old `const autoScaler = getAutoScaler()` at module load ran during the
+// import phase — BEFORE index.js initialize() could set the authoritative
+// config — and won the "first-config-wins" singleton race, pinning the live
+// scaler to the constructor defaults (min1/max10/desired3, i.e. a max of 10,
+// double the anti-detection ceiling of 5). Now we resolve lazily inside the
+// functions that need it; by the time scraping runs, index.js has called
+// configureAutoScaler() with the authoritative {min1,max5,desired3}.
+function _getAutoScaler() {
+    return getAutoScaler();
+}
+
 logger.info(`[EmailScraper] Navigation Hooks enabled with ${navigationHooks.postHooks.length} post-hooks`);
-logger.info(`[EmailScraper] AutoScaler ready: ${autoScaler.toString()}`);
 
 // M8-MISS1: Register email scraper dependencies in ServiceContainer
 // These are available via container.get() for cross-module resolution.
@@ -251,6 +269,17 @@ export async function isCircuitOpen(domain) {
         const all = await _circuitBreakerState.get();
         const state = all[domain];
         if (!state) return false;
+
+        // Forensic #14 (2026-06-11): same fix as lib/CircuitBreaker.js — the
+        // half-open / cooldown machinery applies ONLY to a circuit that has
+        // actually OPENED (failures >= CIRCUIT_OPEN_THRESHOLD → openedAt set).
+        // A sub-threshold entry still has openedAt=0, making `now - openedAt`
+        // vacuously huge so the half-open branch always fired, consuming the
+        // trial budget and re-opening the domain with failures=THRESHOLD from a
+        // single transient failure; the threshold check below was unreachable.
+        if (!state.openedAt || (state.failures || 0) < CIRCUIT_OPEN_THRESHOLD) {
+            return false;
+        }
 
         const now = Date.now();
         const elapsed = now - (state.openedAt || 0);
@@ -1036,6 +1065,21 @@ export function isCloudflareChallenge(html) {
 }
 
 /**
+ * Forensic #15 (2026-06-11): build an Error already accounted for by the
+ * in-try failure path (markBad / recordCircuitFailure with the correct band /
+ * recordRequest). The catch checks `_fetchAccounted` and skips the triple so a
+ * single fetch failure is recorded exactly once (no double session-error
+ * points, no DEFAULT-band overwrite of an adaptive cooldown).
+ * @param {string} message
+ * @returns {Error}
+ */
+function _accountedFetchError(message) {
+    const err = new Error(message);
+    err._fetchAccounted = true;
+    return err;
+}
+
+/**
  * Fetch website HTML with timeout, session tracking, and statistics
  * CRAWLEE-INSPIRED: Uses SessionPool for fingerprinting and tracks metrics
  * @param {string} url - URL to fetch
@@ -1156,7 +1200,12 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
                 domain,
                 error: postResult.blockReason
             });
-            throw new Error(postResult.blockReason);
+            // Forensic #15: this path already did markBad + recordCircuitFailure
+            // (with the CORRECT band) + recordRequest. Tag the error so the catch
+            // does NOT re-run all three — pre-fix the catch's second
+            // recordCircuitFailure used the DEFAULT band, OVERWRITING lastError
+            // and degrading the cooldown (e.g. 5min → 3min).
+            throw _accountedFetchError(postResult.blockReason);
         }
 
         // Handle hook-requested retry
@@ -1183,7 +1232,9 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
                 domain,
                 error: 'CLOUDFLARE_PROTECTED'
             });
-            throw new Error('CLOUDFLARE_PROTECTED');
+            // Forensic #15: accounted here with the correct 5min band; tag so
+            // the catch doesn't double-count and overwrite the band with DEFAULT.
+            throw _accountedFetchError('CLOUDFLARE_PROTECTED');
         }
 
         // LOG-002 FIX: Validate HTML response is not empty or minimal
@@ -1198,7 +1249,16 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
                 domain,
                 error: 'empty_html_response'
             });
-            throw new Error(`EMPTY_HTML: Response only ${html?.length || 0} chars (min: ${MIN_VALID_HTML_LENGTH})`);
+            // Forensic #15: pre-fix this path ran markBad + recordRequest, then
+            // the catch ran markBad + recordRequest AGAIN (double session-error
+            // points, double stats) — the error string carries no blocking
+            // keyword, so the catch correctly added NO circuit failure, but the
+            // double markBad retired the fingerprint twice as fast. We DELIBERATELY
+            // do not open the circuit on EMPTY_HTML: it is the tab-fallback trigger
+            // (JS-rendered site), not a domain block — circuit-opening it would
+            // skip the very tab fallback that recovers these sites. Tag so the
+            // catch does not re-run markBad/recordRequest.
+            throw _accountedFetchError(`EMPTY_HTML: Response only ${html?.length || 0} chars (min: ${MIN_VALID_HTML_LENGTH})`);
         }
 
         // Record success
@@ -1211,7 +1271,7 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
         });
 
         // CRAWLEE PHASE 3.2: Record success for AutoScaler
-        autoScaler.recordResult(true, { domain, duration });
+        _getAutoScaler().recordResult(true, { domain, duration });
 
         return html;
     } catch (error) {
@@ -1237,25 +1297,37 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
             errorMsgLower.includes('http 403') ||
             errorMsgLower.includes('http 429');
 
-        // P1-001 FIX: Only mark session as bad for blocking errors, NOT for 404
-        // 404 means the page doesn't exist, not that we're blocked
-        if (!isNotFoundError) {
-            _getPool().markBad(sessionId, domain);
+        // Forensic #15 (2026-06-11): single-accounting guard. The in-try failure
+        // paths (hook block / Cloudflare / EMPTY_HTML) already recorded markBad +
+        // recordCircuitFailure (with the CORRECT band) + recordRequest, then threw
+        // a tagged error. Pre-fix the catch re-ran ALL THREE: markBad twice
+        // (fingerprint retired at 2 pages instead of 3), recordRequest twice, and
+        // a SECOND recordCircuitFailure with the DEFAULT band that overwrote
+        // lastError — degrading the Cloudflare cooldown from 5min to 3min and
+        // partially defeating BUG-5. Skip the triple for already-accounted errors.
+        if (!error?._fetchAccounted) {
+            // P1-001 FIX: Only mark session as bad for blocking errors, NOT for 404
+            // 404 means the page doesn't exist, not that we're blocked
+            if (!isNotFoundError) {
+                _getPool().markBad(sessionId, domain);
+            } else {
+                logger.debug(`[SessionPool] Skipping markBad for 404 (page not found, not a block)`);
+            }
+
+            // P1-002 FIX: Record circuit breaker failures for blocking errors
+            if (isBlockingError) {
+                await recordCircuitFailure(domain);
+            }
+
+            _getStats().recordRequest({
+                duration,
+                success: false,
+                domain,
+                error: error.message
+            });
         } else {
-            logger.debug(`[SessionPool] Skipping markBad for 404 (page not found, not a block)`);
+            logger.debug(`[CIRCUIT] Skipping duplicate accounting for already-accounted error: ${errorMsg}`);
         }
-
-        // P1-002 FIX: Record circuit breaker failures for blocking errors
-        if (isBlockingError) {
-            await recordCircuitFailure(domain);
-        }
-
-        _getStats().recordRequest({
-            duration,
-            success: false,
-            domain,
-            error: error.message
-        });
 
         // CRAWLEE PHASE 3.2: Record failure for AutoScaler
         // FIX: Only record REAL failures that indicate system overload
@@ -1265,7 +1337,7 @@ export async function fetchWebsiteHTML(url, pageContext = null) {
             !errorMsgLower.includes('session retired');
 
         if (isSystemFailure) {
-            autoScaler.recordResult(false, { domain, duration, error: error.message });
+            _getAutoScaler().recordResult(false, { domain, duration, error: error.message });
         } else {
             // Record as neutral (don't affect scaling decisions)
             logger.debug(`[AutoScaler] Skipping recordResult for ${isBlockingError ? 'blocking' : '404'} error (not a system issue)`);
@@ -2055,7 +2127,9 @@ export default {
     resetStatistics,
     persistState,
     restoreState,
-    // HIGH-003 FIX: Export circuit breaker functions for TabScraperFallback
+    // Circuit-breaker functions (HIGH-003). Since the §3.D.3 cycle break,
+    // TabScraperFallback receives these via setCircuitHooks injection — the
+    // exports remain for tests and external consumers.
     isCircuitOpen,
     recordCircuitSuccess,
     recordCircuitFailure

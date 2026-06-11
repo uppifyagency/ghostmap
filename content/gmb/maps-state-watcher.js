@@ -763,9 +763,11 @@
      * still the anemic homepage value because Maps never re-rendered).
      *
      * We monkey-patch history.pushState/replaceState (idempotent), listen
-     * to the synthetic `ghostmap:locationchange` event we dispatch from
-     * inside, and re-evaluate. Per-pathname sentinel above ensures one
-     * reload per distinct search URL.
+     * to the synthetic `gmp:urlchange` event we dispatch from inside, and
+     * re-evaluate. Per-pathname sentinel above ensures one reload per
+     * distinct search URL. NOTE: `gmp:urlchange` is also the R-DETAIL
+     * trigger for the ISOLATED-world observer (forensic #2) — DOM events
+     * cross isolated-world boundaries, so do not rename or remove it.
      */
     // CO-1 FIX (2026-05-11): pre-fix used `window.__gmpUrlChangeHooked`
     // as the idempotency sentinel — a page-observable string property

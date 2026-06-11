@@ -743,11 +743,16 @@ function handleComplete(result) {
     const failedSaveEvents = s.failedSaveEvents || 0;
     const pendingInQueue = s.pendingInQueue || 0;
     const quotaFailures = s.quotaFailures || 0;
+    const cellsNotSearched = s.cellsNotSearched || 0;
     let saveHealthText = '';
     if (recoveredFromQueue > 0) saveHealthText += `\n♻️ ${recoveredFromQueue} recuperati da ricerche precedenti`;
     if (failedSaveEvents > 0) saveHealthText += `\n⚠️ ${failedSaveEvents} salvataggi falliti in questa ricerca`;
     if (pendingInQueue > 0) saveHealthText += `\n📥 ${pendingInQueue} in coda di recupero (riprovati al prossimo avvio)`;
     if (quotaFailures > 0) saveHealthText += `\n🛑 Spazio di archiviazione pieno — esporta o pulisci i dati`;
+    // Forensic #18 (2026-06-11): never-visited grid cells (CAPTCHA cooldown /
+    // tab-creation failures abandoned the batch tail). Surfaced so the area is
+    // not silently reported as fully covered.
+    if (cellsNotSearched > 0) saveHealthText += `\n🔍 ${cellsNotSearched} celle non esplorate (zona sotto-campionata — riprova per coprirle)`;
 
     const statsText = result.stats ?
         `\n\nBusinesses found: ${s.businessesFound || 0} ` +
@@ -756,7 +761,23 @@ function handleComplete(result) {
         `With phone: ${s.withPhone || 0}` + saveHealthText :
         '';
 
-    alert(`✅ Area Search Complete!${statsText}\n\nDuration: ${result.duration}\n\n💡 Tip: Check the main view for scraped businesses.\nClick "Scrape Emails" to extract emails from websites.`);
+    // Forensic #7b (2026-06-11): the SW now tags every run end with a reason
+    // (completed | stopped | aborted | saturated). Pre-fix this alert said
+    // "Complete! 🎉" even when the run aborted after 3 consecutive batch
+    // errors or the user pressed Stop. Unknown/missing reason falls back to
+    // the celebratory message (compatibility with an older SW during update).
+    const reason = result.reason || 'completed';
+    const headerByReason = {
+        completed: '✅ Area Search Complete!',
+        saturated: '✅ Area Search Complete!\n(area saturata: terminata in anticipo — altre celle non avrebbero aggiunto risultati)',
+        stopped: '⏹️ Area Search interrotta dall\'utente.\nI risultati raccolti finora sono salvati.',
+        aborted: '⚠️ Area Search INTERROTTA: 3 batch consecutivi falliti.\nI risultati raccolti prima dell\'interruzione sono salvati — controlla connessione/CAPTCHA e riprova.'
+    };
+    const header = headerByReason[reason] || headerByReason.completed;
+    const tipText = (reason === 'completed' || reason === 'saturated')
+        ? '\n\n💡 Tip: Check the main view for scraped businesses.\nClick "Scrape Emails" to extract emails from websites.'
+        : '';
+    alert(`${header}${statsText}\n\nDuration: ${result.duration}${tipText}`);
 
     // Reset start button
     const startBtn = document.getElementById('startAreaSearchBtn');

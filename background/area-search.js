@@ -28,7 +28,6 @@
 import { CONFIG } from '../lib/config.js';
 import { getSessionPool } from '../lib/SessionPool.js';
 import { getStatistics } from '../lib/Statistics.js';
-import { getTimerRegistry } from '../lib/TimerRegistry.js';
 import { Mutex } from '../lib/mutex.js';
 // OBS-4 (2026-05-17): import DB for finalize-time stats reconciliation. The
 // per-batch accumulators (`stats.withWebsite/withPhone`) overcount because
@@ -52,13 +51,16 @@ import {
 // The inline version in executeScript is used because executeScript runs in page context
 // and cannot use imported modules. See BUG-004 note in extractEnhanced function.
 
-// Initialize session pool for anti-detection
-const sessionPool = getSessionPool({
-    maxPoolSize: 20,           // Max 20 sessions in pool
-    maxUsageCount: 30,         // Retire session after 30 uses
-    maxErrorScore: 3,          // Retire after 3 errors
-    maxAgeSecs: 1800           // 30 minute max age
-});
+// Session pool for anti-detection (lazy accessor).
+// Forensic #11 (2026-06-11): this used to call getSessionPool({...config...})
+// at module load with maxErrorScore:3 — racing index.js initialize()'s
+// authoritative {maxErrorScore:5, maxAgeSecs:1800} under "first-config-wins".
+// Now we resolve lazily with NO options (pure accessor); index.js owns the
+// authoritative config and SessionPool.initialize() applies it to the live
+// instance regardless of creation order.
+function _getSessionPool() {
+    return getSessionPool();
+}
 
 // Initialize statistics tracking
 const statistics = getStatistics({
@@ -984,6 +986,9 @@ async function startTurboV3(config) {
     const totalBatches = Math.ceil(searches.length / parallelTabs);
 
     // Initialize
+    // Forensic #7: clear any stale end-reason from a previous run (stopTurbo
+    // sets it even when called with no run active).
+    _finishReason = null;
     Object.assign(TURBO_STATE, {
         isRunning: true,
         isPaused: false,
@@ -1055,6 +1060,16 @@ async function createTabsWithRecovery(batch) {
                         cooldownMs: remaining
                     }
                 }).catch(() => { });
+                // Forensic #18 (2026-06-11): record the UN-TRIED tail (this
+                // search at i, plus everything after) into failedSearches.
+                // Pre-fix the break abandoned these silently — they were neither
+                // created nor recorded as failed, yet the caller's `finally`
+                // still did `completedSearches += batch.length`, so never-visited
+                // cells counted as completed and the area was under-sampled with
+                // ZERO signal to the user.
+                for (let k = i; k < shuffledBatch.length; k++) {
+                    failedSearches.push({ search: shuffledBatch[k], error: 'circuit_open_abandoned' });
+                }
                 break; // Exit loop, don't continue silently
             }
 
@@ -1073,7 +1088,7 @@ async function createTabsWithRecovery(batch) {
             }
 
             // Get session with fingerprint for anti-detection
-            const session = await sessionPool.getSession();
+            const session = await _getSessionPool().getSession();
 
             // ANTI-DETECTION: Add coordinate jitter to URL
             let jitteredUrl = search.url;
@@ -1147,6 +1162,20 @@ async function createTabsWithRecovery(batch) {
                 // Cleanup already created tabs
                 await cleanupTabs(createdTabs);
 
+                // Forensic #18 (review NIT): this abort THROWS, so the caller's
+                // normal cellsNotSearched accumulation (which reads the RETURNED
+                // failedSearches) never runs for this batch — the abandoned cells
+                // would be invisible. Record the failed + un-tried tail here so
+                // the under-sampling is still surfaced. Tail is [i+1..end]; the
+                // current search at i already pushed its own failure above.
+                for (let k = i + 1; k < shuffledBatch.length; k++) {
+                    failedSearches.push({ search: shuffledBatch[k], error: 'aborted_high_failure_rate' });
+                }
+                TURBO_STATE.stats = {
+                    ...TURBO_STATE.stats,
+                    cellsNotSearched: (TURBO_STATE.stats.cellsNotSearched || 0) + failedSearches.length
+                };
+
                 throw new Error(
                     `Tab creation failed: ${failedSearches.length}/${shuffledBatch.length} failures. ` +
                     `System may be overwhelmed. Try reducing parallel tabs.`
@@ -1156,6 +1185,12 @@ async function createTabsWithRecovery(batch) {
             // If 2+ consecutive failures, reduce speed
             if (CaptchaDetector.consecutiveFailures >= 2) {
                 console.warn('[CAPTCHA] Slowing down due to failures...');
+                // Forensic #18: record the un-tried tail (i+1..end). The current
+                // search at i already pushed its own failure above; everything
+                // after i was being abandoned silently.
+                for (let k = i + 1; k < shuffledBatch.length; k++) {
+                    failedSearches.push({ search: shuffledBatch[k], error: 'aborted_consecutive_failures' });
+                }
                 break;
             }
         }
@@ -1682,7 +1717,14 @@ async function runTurboV3() {
             createdTabs = tabs;
 
             if (failedSearches.length > 0) {
-                console.warn(`[SECURITY] ${failedSearches.length}/${batch.length} tabs failed to create`);
+                console.warn(`[SECURITY] ${failedSearches.length}/${batch.length} cells failed/abandoned this batch`);
+                // Forensic #18: accumulate into stats so finishTurbo can report
+                // under-sampled cells instead of silently counting them done.
+                // B3-1: replacement-style write so the Proxy persists the change.
+                TURBO_STATE.stats = {
+                    ...TURBO_STATE.stats,
+                    cellsNotSearched: (TURBO_STATE.stats.cellsNotSearched || 0) + failedSearches.length
+                };
             }
 
             if (createdTabs.length === 0) {
@@ -1870,6 +1912,7 @@ async function runTurboV3() {
             // Early termination when area is saturated
             if (TURBO_STATE.consecutiveLowYield >= GRID_OPTIMIZER.MAX_CONSECUTIVE_LOW_YIELD) {
                 console.log('[OPTIMIZER] 🏁 Early termination: Area saturated');
+                _finishReason = 'saturated'; // forensic #7: honest completion dialog
                 TURBO_STATE.isRunning = false;
             }
 
@@ -1884,9 +1927,14 @@ async function runTurboV3() {
             // Abort if too many consecutive failures
             if (_newBatchErrors >= SECURITY_LIMITS.MAX_CONSECUTIVE_BATCH_ERRORS) {
                 console.error(`[SECURITY] ⛔ Aborting area search: ${SECURITY_LIMITS.MAX_CONSECUTIVE_BATCH_ERRORS} consecutive batch failures`);
+                _finishReason = 'aborted';
                 TURBO_STATE.isRunning = false;
-                // BUG-002 FIX: Reset state to prevent memory leak on abort
-                resetTurboState();
+                // Forensic #7a: the old `resetTurboState()` HERE (BUG-002) nulled
+                // startTime BEFORE finishTurbo computed the duration → ~56-year
+                // "epochal" duration in the dialog, and wiped the run stats the
+                // dialog was about to show. finishTurbo already resets state at
+                // the end of EVERY path (it runs right after this break), so the
+                // memory-leak concern BUG-002 addressed is still covered.
                 break;  // Exit while loop
             }
 
@@ -2003,6 +2051,22 @@ async function runTurboV3() {
     // signals AFTER the completion message has dispatched, preserving the
     // happens-before relationship stopTurbo callers rely on.
     await finishTurbo();
+    } catch (runLoopErr) {
+        // Forensic #5/#7 adversarial follow-up (N1, 2026-06-11): a throw
+        // OUTSIDE the per-batch try (config destructuring, batch slicing,
+        // sleep, finishTurbo itself) used to skip finishTurbo entirely — no
+        // state reset, no completion dialog, keepalive never released — and
+        // runTurboV3() is fired without a .catch at the start site, so it
+        // also became an unhandled rejection. Funnel it through finishTurbo
+        // as an abort; the inner guard keeps a second failure from escaping.
+        console.error('[TURBO] run loop crashed outside batch handling:',
+            runLoopErr instanceof Error ? runLoopErr.message : String(runLoopErr));
+        _finishReason = 'aborted';
+        TURBO_STATE.isRunning = false;
+        try { await finishTurbo(); } catch (finishErr) {
+            console.error('[TURBO] finishTurbo failed during crash recovery:',
+                finishErr instanceof Error ? finishErr.message : String(finishErr));
+        }
     } finally {
         // F-03: signal sentinel so stopTurbo (if awaiting) can proceed past
         //       its await and tear down state cleanly. Single-shot.
@@ -3040,9 +3104,30 @@ function broadcastProgress() {
     }).catch(() => { });
 }
 
+// Forensic #5/#7 (2026-06-11): why every run ends in finishTurbo, and what it
+// must tell the outside world.
+//
+//   • _finishReason — set by the run loop (saturated/aborted), by stopTurbo
+//     (stopped), or left null (natural completion). Consumed exactly once per
+//     run; startTurboV3 clears any stale value. Pre-fix the dialog showed
+//     "Area Search Complete! 🎉" on EVERY exit path, including the
+//     3-consecutive-batch-errors abort.
+//   • _onRunFinished — hook registered by background/index.js to stop the
+//     30s keepalive alarm. Pre-fix startKeepAlive() fired on start but
+//     stopKeepAlive() only in the MANUAL stop handler: after every run that
+//     completed on its own the alarm kept the SW alive forever (battery /
+//     resource leak that defeated the whole MV3 lifecycle design).
+let _finishReason = null;
+let _onRunFinished = null;
+function setOnRunFinished(cb) { _onRunFinished = cb; }
+
 async function finishTurbo() {
     TURBO_STATE.isRunning = false;
-    const duration = Date.now() - TURBO_STATE.startTime;
+    const reason = _finishReason || 'completed';
+    _finishReason = null;
+    // Forensic #7a: guard the null/zero startTime (same fix broadcastProgress
+    // got earlier — `Date.now() - null` renders as a ~56-year duration).
+    const duration = TURBO_STATE.startTime ? Date.now() - TURBO_STATE.startTime : 0;
 
     // OBS-4 (2026-05-17): reconcile dialog stats with DB-truth.
     //
@@ -3143,7 +3228,13 @@ async function finishTurbo() {
                 quotaFailures: TURBO_STATE.stats.quotaFailures || 0,
                 dlqDropped: TURBO_STATE.stats.dlqDropped || 0,
                 pendingInQueue,
-                recoveredFromQueue
+                recoveredFromQueue,
+                // Forensic #18: grid cells that were never visited (CAPTCHA
+                // cooldown / consecutive tab-creation failures abandoned the
+                // batch tail). Preserved through the DB-truth overwrite and
+                // surfaced in the completion dialog so the user knows the area
+                // was under-sampled instead of believing it fully covered.
+                cellsNotSearched: TURBO_STATE.stats.cellsNotSearched || 0
             };
         }
     } catch (e) {
@@ -3175,7 +3266,10 @@ async function finishTurbo() {
         action: 'area_search_complete',
         payload: {
             duration: formatDuration(duration),
-            stats: TURBO_STATE.stats
+            stats: TURBO_STATE.stats,
+            // Forensic #7b: completed | stopped | aborted | saturated — the UI
+            // dialog must not celebrate an abort.
+            reason
         }
     }).catch(() => { });
 
@@ -3193,6 +3287,15 @@ async function finishTurbo() {
 
     // CRITICAL: Reset state to prevent memory leaks
     resetTurboState();
+
+    // Forensic #5: EVERY run-end path converges here (natural completion,
+    // saturation, abort, and user stop — the run loop awaits finishTurbo
+    // before signalling stopTurbo's sentinel), so this is the single correct
+    // place to release the keepalive alarm. Idempotent with the manual-stop
+    // handler's stopKeepAlive (chrome.alarms.clear tolerates a missing alarm).
+    try { _onRunFinished?.(reason); } catch (e) {
+        console.warn('[TURBO finalize] onRunFinished hook failed:', e instanceof Error ? e.message : String(e));
+    }
 }
 
 async function getCoords(city) {
@@ -3438,6 +3541,10 @@ async function _closeOrphanWindows(label) {
 }
 
 async function stopTurbo() {
+    // Forensic #7b: user stop flows through the run loop's finishTurbo (we
+    // await its sentinel below) — tag the reason BEFORE flipping the flag so
+    // the completion dialog says "stopped", not "Complete! 🎉".
+    if (TURBO_STATE.isRunning) _finishReason = 'stopped';
     TURBO_STATE.isRunning = false;
 
     // F-03: wait for the run loop's in-progress batch finally to complete
@@ -3454,10 +3561,10 @@ async function stopTurbo() {
     // AS-01: shared sweep helper (was inlined here pre-fix; behavior identical)
     await _closeOrphanWindows('BGW-H3');
 
-    // FIX H-002: Clear all area-search owned timers to prevent memory leaks
-    const timerRegistry = getTimerRegistry();
-    const clearedTimers = timerRegistry.clearByOwner('area-search');
-    console.log(`[TURBO] Cleared ${clearedTimers} area-search timers`);
+    // FASE-1 PURGE (2026-06-11): the H-002 TimerRegistry drain was theater —
+    // nothing ever registered a timer under owner 'area-search', so
+    // clearByOwner always swept an empty bucket. Module deleted; the real
+    // timer/handle cleanup is resetTurboState below.
 
     resetTurboState(); // CRITICAL: Clear memory on stop
     return { status: 'stopped', cleanedUp: true };
@@ -3491,7 +3598,7 @@ Add to background/index.js:
 // EXPORTS
 // =====================================================
 
-export { startTurboV3, pauseTurbo, resumeTurbo, stopTurbo, getTurboStatus, setSaveHandler };
+export { startTurboV3, pauseTurbo, resumeTurbo, stopTurbo, getTurboStatus, setSaveHandler, setOnRunFinished };
 // v9.11: Exported for unit tests in tests/area_search_detail_drain.test.js.
 // These are NOT part of the public API — internal helpers used by runTurboV3.
 export { _wakeObserversInTabs, _waitForDetailFetcherIdle, _collectDetailFetcherStats };
@@ -3501,4 +3608,4 @@ export { _closeOrphanWindows };
 // fix-area-search-wrong-center (01-01): pure, rank-preserving Nominatim
 // settlement selection. Exported for tests/run-area-search-geocode-node.mjs.
 export { selectGeocodeResult };
-export default { start: startTurboV3, pause: pauseTurbo, resume: resumeTurbo, stop: stopTurbo, status: getTurboStatus, setSaveHandler };
+export default { start: startTurboV3, pause: pauseTurbo, resume: resumeTurbo, stop: stopTurbo, status: getTurboStatus, setSaveHandler, setOnRunFinished };

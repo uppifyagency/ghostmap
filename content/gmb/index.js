@@ -10,7 +10,7 @@
  */
 
 import { DOMObserver } from './observer.js';
-import { CONFIG } from '../../lib/config.js';
+import { CONFIG, loadConfig } from '../../lib/config.js';
 import { logger } from '../../lib/utils.js';
 
 logger.info('Content script loaded');
@@ -326,7 +326,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // Keep channel open for async responses
 });
 
-// Auto-initialize on load
-initialize();
+// Auto-initialize on load.
+// Forensic #12 (2026-06-11): loadConfig() was never invoked ANYWHERE, so any
+// userConfig.selectors override saved by the settings UI was dead. CONFIG.selectors
+// is consumed HERE in the content-script context (observer.js getElements(
+// CONFIG.selectors.businessLink, ...)), NOT in the service worker — the two run
+// in separate JS realms with separate CONFIG instances, so calling loadConfig()
+// in the SW (the report's first suggestion) would have been a no-op for DOM
+// extraction. We invoke it here and merge BEFORE constructing the observer.
+// loadConfig() mutates CONFIG.selectors in place via safeMerge (prototype-
+// pollution-safe), so the captured CONFIG reference sees the overrides.
+//
+// KNOWN LIMITATION (flagged for product decision, see FINDINGS): the settings
+// UI currently exposes title/phone/website/address selector fields, but those
+// keys are NOT consumed anywhere (SelectorEngine uses its own hardcoded
+// strategies; only businessLink/scrollContainer/businessCard are read here).
+// Wiring loadConfig() makes the MECHANISM real for the consumed keys; making
+// the 4 UI fields effective is a separate feature (or they should be removed).
+(async () => {
+    try {
+        await loadConfig();
+    } catch (err) {
+        logger.warn(`[CONFIG] loadConfig() failed, using defaults: ${err?.message || err}`);
+    }
+    initialize();
+})();
 
 logger.info('Content script ready');
