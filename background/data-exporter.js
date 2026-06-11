@@ -356,15 +356,18 @@ export function generateCSV(businesses) {
         b.emailScraped ? (b.email ? 'success' : 'no_email') : 'pending',
         formatPartitaIvaForCsv(b.partitaIva || ''),
         formatPartitaIvaForCsv(b.codiceFiscale || ''),
-        // DEBT-CSV-1 (2026-06-11): detail-fetcher back-fill. hoursRaw /
-        // reviewCount carry the same semantics from a different source
-        // (detail-page HTML), so they fall back into the existing columns
-        // instead of adding near-duplicate ones. `??` keeps a card-extracted
-        // 0 from being masked; the trailing || '' preserves the historical
-        // 0/null → empty-cell behavior.
-        escapeCsv(b.openingHours || b.hoursRaw || ''),
+        // DEBT-CSV-1 ROLLBACK (2026-06-11, sera): the hoursRaw/reviewCount
+        // CSV fallbacks were REVERTED after the first real export (Verona
+        // run) showed (a) hoursRaw is a raw 1000-char JSPB slice — it is
+        // PROVISIONAL telemetry input, not a user-facing value — and
+        // (b) the detail-fetcher's rating/reviewCount anchor regex
+        // mis-parses (review counts equal to digits in the business NAME:
+        // 88TRE→88, Pub 900→900). Both fields still flow to DB + JSON
+        // export; re-enable here only after the parser is validated
+        // (FINDINGS: DEBT-CSV-1 rollback + DF-PARSE-1).
+        escapeCsv(b.openingHours || ''),
         b.rating || '',
-        (b.reviews ?? b.reviewCount) || '',
+        b.reviews || '',
         escapeCsv(b.address),
         escapeCsv(b.social?.facebook),
         escapeCsv(b.social?.instagram),
