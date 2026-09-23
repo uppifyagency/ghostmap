@@ -1,0 +1,534 @@
+/**
+ * MIT License
+ * Copyright (c) 2025 Ghost Map Pro Team
+ * https://github.com/ghost-map-pro
+ * 
+ * INSPIRED BY: Crawlee AutoscaledPool
+ * https://crawlee.dev/js/docs/guides/scaling-crawlers
+ */
+
+/**
+ * Ghost Map Pro - AutoScaler
+ * Adaptive concurrency control based on:
+ * - System resource status
+ * - Success rate of recent requests
+ * - Error patterns
+ * 
+ * Automatically scales up when things are going well,
+ * and scales down when detecting problems.
+ * 
+ * CRAWLEE FEATURE 3.2
+ */
+
+import { logger } from './utils.js';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTOSCALER CLASS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export class AutoScaler {
+    /**
+     * Create a new AutoScaler
+     * @param {Object} options - Configuration options
+     * @param {number} [options.minConcurrency=1] - Minimum concurrency level
+     * @param {number} [options.maxConcurrency=5] - Maximum concurrency level (anti-detection ceiling)
+     * @param {number} [options.desiredConcurrency=3] - Starting concurrency level
+     * @param {number} [options.scaleUpStepSize=1] - How much to increase per scale up
+     * @param {number} [options.scaleDownStepSize=1] - How much to decrease per scale down
+     * @param {number} [options.scaleUpIntervalMs=10000] - Minimum time between scale ups
+     * @param {number} [options.scaleDownIntervalMs=5000] - Minimum time between scale downs
+     * @param {number} [options.successRateThresholdUp=0.9] - Success rate needed to scale up
+     * @param {number} [options.successRateThresholdDown=0.7] - Success rate below which to scale down
+     * @param {number} [options.windowSize=20] - Size of rolling success window
+     */
+    constructor(options = {}) {
+        // BUG-AS-Falsy-Defaults (AutoScaler audit, 2026-05-09):
+        // Pre-fix used `||` for option defaults. The `||` falsy fallback
+        // fires for ANY falsy value including legitimate `0` — so an
+        // explicit caller intent like `scaleUpIntervalMs: 0` (no cooldown)
+        // or `successRateThresholdUp: 0` (always scale up) was silently
+        // overridden by the default. Switching to `??` (nullish-coalesce)
+        // preserves caller-provided zeros and only falls back when the
+        // option is truly absent. Real-world impact today is theoretical
+        // (no current caller passes 0 — see background/jobQueue.js:41,
+        // background/index.js:218), but the fix removes a defensive trap.
+        // Test: tests/run-autoscaler-pure-logic-node.mjs (Test 1).
+        this.options = {
+            minConcurrency: options.minConcurrency ?? 1,
+            // Forensic #9 (2026-06-11): default ceiling lowered 10 → 5. The
+            // anti-detection design ceiling is 5; the authoritative
+            // configureAutoScaler() in index.js sets it explicitly, but making
+            // the CONSTRUCTOR default 5 too is defense-in-depth — an instance
+            // that is never reconfigured (e.g. SW init failed) still cannot
+            // scale past 5. This was the root cause of #9: the live scaler ran
+            // the old default of 10, double the ceiling.
+            maxConcurrency: options.maxConcurrency ?? 5,
+            desiredConcurrency: options.desiredConcurrency ?? 3,
+            scaleUpStepSize: options.scaleUpStepSize ?? 1,
+            scaleDownStepSize: options.scaleDownStepSize ?? 1,
+            scaleUpIntervalMs: options.scaleUpIntervalMs ?? 10000,
+            scaleDownIntervalMs: options.scaleDownIntervalMs ?? 5000,
+            successRateThresholdUp: options.successRateThresholdUp ?? 0.9,
+            successRateThresholdDown: options.successRateThresholdDown ?? 0.7,
+            windowSize: options.windowSize ?? 20,
+            // Cooldown after errors before allowing scale up
+            errorCooldownMs: options.errorCooldownMs ?? 30000
+        };
+
+        // Current state
+        this.currentConcurrency = this.options.desiredConcurrency;
+        this.desiredConcurrency = this.options.desiredConcurrency;
+
+        // Timing
+        this.lastScaleUp = 0;
+        this.lastScaleDown = 0;
+        this.lastError = 0;
+
+        // Rolling window for success tracking
+        this.successWindow = [];
+
+        // Statistics
+        this.stats = {
+            scaleUpCount: 0,
+            scaleDownCount: 0,
+            totalEvaluations: 0,
+            peakConcurrency: this.options.desiredConcurrency,
+            lowestConcurrency: this.options.desiredConcurrency
+        };
+
+        logger.info(`[AutoScaler] 🎚️ Initialized: min=${this.options.minConcurrency}, max=${this.options.maxConcurrency}, initial=${this.desiredConcurrency}`);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Result Recording
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Record the result of a request
+     * @param {boolean} success - Whether the request succeeded
+     * @param {Object} [metadata] - Optional metadata about the request
+     */
+    recordResult(success, metadata = {}) {
+        // Add to rolling window
+        this.successWindow.push({
+            success: success ? 1 : 0,
+            timestamp: Date.now(),
+            ...metadata
+        });
+
+        // Trim to window size
+        while (this.successWindow.length > this.options.windowSize) {
+            this.successWindow.shift();
+        }
+
+        // Track last error time
+        if (!success) {
+            this.lastError = Date.now();
+        }
+    }
+
+    /**
+     * Get current success rate from rolling window
+     * @returns {number} Success rate (0-1)
+     */
+    getSuccessRate() {
+        if (this.successWindow.length === 0) {
+            return 1; // No data, assume good
+        }
+
+        const successCount = this.successWindow.reduce((sum, r) => sum + r.success, 0);
+        return successCount / this.successWindow.length;
+    }
+
+    /**
+     * Get weighted success rate (recent results matter more)
+     * @returns {number} Weighted success rate (0-1)
+     */
+    getWeightedSuccessRate() {
+        if (this.successWindow.length === 0) {
+            return 1;
+        }
+
+        let weightedSum = 0;
+        let weightSum = 0;
+
+        this.successWindow.forEach((result, index) => {
+            // Linear weight: more recent = higher weight
+            const weight = index + 1;
+            weightedSum += result.success * weight;
+            weightSum += weight;
+        });
+
+        return weightedSum / weightSum;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Evaluation
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Evaluate current state and adjust concurrency
+     * @param {Object} systemStatus - Status from SystemMonitor
+     * @returns {number} New desired concurrency
+     */
+    evaluate(systemStatus = {}) {
+        // LIB-6 FIX (2026-05-10): honour the _paused flag set by pause()/resume().
+        // Pre-fix `evaluate()` ignored _paused entirely — pause()/resume() were
+        // documented contract-promises that did not affect scaling decisions.
+        // Concretely: a caller pausing the scaler before triggering a cleanup
+        // that involves error spikes would still observe scale-down because
+        // the periodic evaluate() tick continued running. After resume() the
+        // cleanup-induced low concurrency would persist with no scale-up
+        // signal until the next normal failure → success transition.
+        if (this._paused) {
+            return this.desiredConcurrency;
+        }
+        this.stats.totalEvaluations++;
+        const now = Date.now();
+        const successRate = this.getSuccessRate();
+        const weightedRate = this.getWeightedSuccessRate();
+
+        // Use the lower of the two rates for safer decisions
+        const effectiveRate = Math.min(successRate, weightedRate);
+
+        // Check if system is overloaded
+        const isOverloaded = systemStatus.isOverloaded || systemStatus.shouldThrottle;
+
+        // Conditions for scale UP
+        const canScaleUp = 
+            !isOverloaded &&
+            effectiveRate >= this.options.successRateThresholdUp &&
+            now - this.lastScaleUp >= this.options.scaleUpIntervalMs &&
+            now - this.lastError >= this.options.errorCooldownMs &&
+            this.desiredConcurrency < this.options.maxConcurrency &&
+            this.successWindow.length >= 5; // Need some data
+
+        // Conditions for scale DOWN
+        const shouldScaleDown =
+            isOverloaded ||
+            effectiveRate < this.options.successRateThresholdDown ||
+            (systemStatus.state === 'critical');
+
+        // Apply scaling decisions
+        if (shouldScaleDown && this.desiredConcurrency > this.options.minConcurrency) {
+            // Scale down
+            const oldConcurrency = this.desiredConcurrency;
+            
+            // Scale down more aggressively if critical
+            const stepSize = systemStatus.state === 'critical' 
+                ? this.options.scaleDownStepSize * 2 
+                : this.options.scaleDownStepSize;
+
+            this.desiredConcurrency = Math.max(
+                this.desiredConcurrency - stepSize,
+                this.options.minConcurrency
+            );
+
+            if (this.desiredConcurrency !== oldConcurrency) {
+                this.lastScaleDown = now;
+                this.stats.scaleDownCount++;
+                this.stats.lowestConcurrency = Math.min(this.stats.lowestConcurrency, this.desiredConcurrency);
+
+                const reason = isOverloaded ? 'system overloaded' : `low success rate (${(effectiveRate * 100).toFixed(1)}%)`;
+                logger.warn(`[AutoScaler] 📉 Scaling DOWN: ${oldConcurrency} → ${this.desiredConcurrency} (${reason})`);
+            }
+        } else if (canScaleUp) {
+            // Scale up
+            const oldConcurrency = this.desiredConcurrency;
+
+            this.desiredConcurrency = Math.min(
+                this.desiredConcurrency + this.options.scaleUpStepSize,
+                this.options.maxConcurrency
+            );
+
+            if (this.desiredConcurrency !== oldConcurrency) {
+                this.lastScaleUp = now;
+                this.stats.scaleUpCount++;
+                this.stats.peakConcurrency = Math.max(this.stats.peakConcurrency, this.desiredConcurrency);
+
+                logger.info(`[AutoScaler] 📈 Scaling UP: ${oldConcurrency} → ${this.desiredConcurrency} (success rate: ${(effectiveRate * 100).toFixed(1)}%)`);
+            }
+        }
+
+        // Update current concurrency (smooth transition)
+        this.currentConcurrency = this.desiredConcurrency;
+
+        return this.desiredConcurrency;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Public API
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Get current desired concurrency
+     * @returns {number}
+     */
+    getConcurrency() {
+        return this.desiredConcurrency;
+    }
+
+    /**
+     * Get current concurrency (alias)
+     * @returns {number}
+     */
+    getCurrentConcurrency() {
+        return this.currentConcurrency;
+    }
+
+    /**
+     * Re-apply configuration to an already-constructed instance.
+     *
+     * Forensic #9 (2026-06-11): the singleton was "first-config-wins", and an
+     * eager no-option getAutoScaler() at module load (email-scraper-v2.js) won
+     * over BOTH the jobQueue and the index.js authoritative calls — so the live
+     * scaler silently ran the constructor DEFAULTS (min1/max10/desired3), i.e.
+     * a max of 10, double the anti-detection design ceiling of 5. Rather than
+     * depend on fragile module-evaluation order, the authoritative caller
+     * (index.js initialize) now calls configureAutoScaler() which routes here
+     * and OVERWRITES the live instance's options regardless of who created it.
+     * Only keys present in `options` are changed; current/desired concurrency
+     * are re-clamped into the (possibly new) [min,max] range.
+     *
+     * @param {Object} options - same shape as the constructor options
+     */
+    reconfigure(options = {}) {
+        // Same ?? semantics as the constructor: only overwrite keys the caller
+        // actually provided (an absent key keeps the existing value).
+        for (const key of [
+            'minConcurrency', 'maxConcurrency', 'desiredConcurrency',
+            'scaleUpStepSize', 'scaleDownStepSize', 'scaleUpIntervalMs',
+            'scaleDownIntervalMs', 'successRateThresholdUp',
+            'successRateThresholdDown', 'windowSize', 'errorCooldownMs'
+        ]) {
+            if (options[key] !== undefined && options[key] !== null) {
+                this.options[key] = options[key];
+            }
+        }
+        // If the caller set a new desiredConcurrency, adopt it; then clamp
+        // both current and desired into the (possibly narrowed) bounds.
+        // (Intermediate var keeps this an apply-if-present, not a falsy/nullish
+        // default — and avoids tripping the bulk-falsy-defaults lint shape.)
+        const nextDesired = options.desiredConcurrency;
+        if (nextDesired !== undefined && nextDesired !== null) {
+            this.desiredConcurrency = nextDesired;
+        }
+        const lo = this.options.minConcurrency;
+        const hi = this.options.maxConcurrency;
+        this.desiredConcurrency = Math.min(Math.max(this.desiredConcurrency, lo), hi);
+        this.currentConcurrency = Math.min(Math.max(this.currentConcurrency, lo), hi);
+        logger.info(`[AutoScaler] Reconfigured: ${this.toString()}`);
+    }
+
+    /**
+     * Force set concurrency (manual override)
+     * @param {number} concurrency - New concurrency level
+     */
+    setConcurrency(concurrency) {
+        const clamped = Math.min(
+            Math.max(concurrency, this.options.minConcurrency),
+            this.options.maxConcurrency
+        );
+
+        if (clamped !== this.desiredConcurrency) {
+            logger.info(`[AutoScaler] ⚙️ Manual override: ${this.desiredConcurrency} → ${clamped}`);
+            this.desiredConcurrency = clamped;
+            this.currentConcurrency = clamped;
+        }
+    }
+
+    /**
+     * Temporarily pause auto-scaling (useful during cleanup)
+     */
+    pause() {
+        this._paused = true;
+        logger.debug('[AutoScaler] Paused');
+    }
+
+    /**
+     * LC-3 (ATP 2026-07-17): honour the shutdownInfrastructure contract so the
+     * shutdown poka-yoke (_recordMiswire) stays meaningful for REAL mis-wires.
+     * Intentionally a no-op: AutoScaler owns no timers or handles, and
+     * onSuspend can be cancelled with the SW (and this module singleton) kept
+     * alive — pausing here would freeze scaling until the next reset() (the
+     * only production _paused-clearer since LC-5; a cancelled onSuspend does
+     * NOT trigger one), with no resume() call-site to recover. Idempotent.
+     */
+    stop() {
+        logger.debug('[AutoScaler] stop() — nothing to release (no timers/handles)');
+    }
+
+    /**
+     * Resume auto-scaling
+     */
+    resume() {
+        this._paused = false;
+        logger.debug('[AutoScaler] Resumed');
+    }
+
+    /**
+     * Check if we have capacity for more work
+     * @param {number} currentActive - Currently active tasks
+     * @returns {boolean}
+     */
+    hasCapacity(currentActive) {
+        return currentActive < this.desiredConcurrency;
+    }
+
+    /**
+     * Get available slots
+     * @param {number} currentActive - Currently active tasks
+     * @returns {number} Number of available slots
+     */
+    getAvailableSlots(currentActive) {
+        return Math.max(0, this.desiredConcurrency - currentActive);
+    }
+
+    /**
+     * Get statistics
+     * @returns {Object}
+     */
+    getStats() {
+        return {
+            currentConcurrency: this.currentConcurrency,
+            desiredConcurrency: this.desiredConcurrency,
+            minConcurrency: this.options.minConcurrency,
+            maxConcurrency: this.options.maxConcurrency,
+            successRate: this.getSuccessRate(),
+            weightedSuccessRate: this.getWeightedSuccessRate(),
+            windowSize: this.successWindow.length,
+            ...this.stats,
+            timeSinceLastScaleUp: Date.now() - this.lastScaleUp,
+            timeSinceLastScaleDown: Date.now() - this.lastScaleDown,
+            timeSinceLastError: Date.now() - this.lastError
+        };
+    }
+
+    /**
+     * Reset to initial state
+     */
+    reset() {
+        this.currentConcurrency = this.options.desiredConcurrency;
+        this.desiredConcurrency = this.options.desiredConcurrency;
+        this.successWindow = [];
+        this.lastScaleUp = 0;
+        this.lastScaleDown = 0;
+        this.lastError = 0;
+        this.stats = {
+            scaleUpCount: 0,
+            scaleDownCount: 0,
+            totalEvaluations: 0,
+            peakConcurrency: this.options.desiredConcurrency,
+            lowestConcurrency: this.options.desiredConcurrency
+        };
+        // LC-5 (ATP 2026-07-17): reset() must fully reset — clear _paused so a
+        // reset from a paused state un-freezes evaluate() (which early-returns
+        // while _paused). pause() is the only setter (stop() is a no-op, LC-3),
+        // but a partial reset that leaves _paused=true would silently freeze
+        // adaptive scaling for the SW lifetime.
+        this._paused = false;
+        logger.info('[AutoScaler] Reset to initial state');
+    }
+
+    /**
+     * Get a summary string for logging
+     * @returns {string}
+     */
+    toString() {
+        const rate = this.getSuccessRate();
+        return `Concurrency: ${this.desiredConcurrency}/${this.options.maxConcurrency} | Success: ${(rate * 100).toFixed(0)}% | ↑${this.stats.scaleUpCount} ↓${this.stats.scaleDownCount}`;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SINGLETON EXPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// MV3 SW EVICTION POLICY (B11-6 cluster triage 2026-05-10): SAFE-BY-SEMANTICS.
+// _instance / _authoritativeConfig hold an AutoScaler instance with rolling
+// stats (successWindow last-20, scale-up/down timers, concurrency level).
+// Loss at SW eviction resets the rolling window — adaptive scaling has a
+// brief "cold start" at wake but rapidly re-converges. The next
+// getAutoScaler() re-creates the singleton with the same config (same
+// _authoritativeConfig path on the new module instance) so callers see
+// consistent behavior. NO data corruption, just transient metric reset.
+
+// SW-EVICTION-SAFE: ephemeral singleton; rolling stats reset on wake by design.
+let _instance = null;
+
+/**
+ * Authoritative config snapshot, captured on first initialization
+ * @type {Object|null}
+ */
+// SW-EVICTION-SAFE: config snapshot re-captured on next getAutoScaler() at wake.
+let _authoritativeConfig = null;
+
+/**
+ * Get the singleton AutoScaler instance
+ * M8-CONFLICT FIX: Detects conflicting config and warns without overwriting
+ * @param {Object} [options] - Options for first initialization
+ * @returns {AutoScaler}
+ */
+export function getAutoScaler(options = {}) {
+    if (!_instance) {
+        _instance = new AutoScaler(options);
+        _instance._lastConflictWarning = null;
+        _authoritativeConfig = { ...options };
+    } else if (Object.keys(options).length > 0) {
+        // Forensic #9 (2026-06-11): pre-fix this only warned when a key
+        // EXISTED in _authoritativeConfig with a different value. But when the
+        // first caller was an eager no-option getAutoScaler() (the actual
+        // bug), _authoritativeConfig was `{}`, so every later configured call
+        // matched no key and was swallowed in total silence. Now: callers must
+        // use configureAutoScaler() to set config authoritatively; any options
+        // passed to the plain getter after creation are ignored AND warned,
+        // regardless of whether _authoritativeConfig is empty.
+        const warningMsg = `[AutoScaler] getAutoScaler() options ignored (singleton already created) — use configureAutoScaler() for authoritative config. Ignored: ${JSON.stringify(options)}`;
+        logger.warn(warningMsg);
+        _instance._lastConflictWarning = warningMsg;
+    }
+    return _instance;
+}
+
+/**
+ * Authoritatively (re)configure the AutoScaler singleton.
+ *
+ * Forensic #9: the SINGLE place that sets AutoScaler config. Creates the
+ * instance if absent, otherwise OVERWRITES the live instance's options via
+ * reconfigure() — so the authoritative config wins no matter what eager
+ * module-load getter created the instance first. Call exactly once from
+ * index.js initialize(). All other modules must use getAutoScaler() with NO
+ * options (pure accessor).
+ *
+ * @param {Object} options
+ * @returns {AutoScaler}
+ */
+export function configureAutoScaler(options = {}) {
+    if (!_instance) {
+        _instance = new AutoScaler(options);
+        _instance._lastConflictWarning = null;
+    } else {
+        _instance.reconfigure(options);
+    }
+    _authoritativeConfig = { ...options };
+    return _instance;
+}
+
+/**
+ * Reset the AutoScaler singleton
+ */
+export function resetAutoScaler() {
+    if (_instance) {
+        _instance.reset();
+    }
+}
+
+/**
+ * Reset singleton for test isolation (test-only)
+ */
+export function resetAutoScalerForTest() {
+    _instance = null;
+    _authoritativeConfig = null;
+}
+
+export default AutoScaler;

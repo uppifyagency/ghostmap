@@ -1,0 +1,300 @@
+/**
+ * Ghost Map Pro - Welcome Page Styles
+ * v9.5 - Dark mode matching main UI
+ */
+
+/* ============================================
+   VARIABLES
+   ============================================ */
+:root {
+    /* Typography */
+    --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+
+    /* Colors */
+    --primary-500: #6366f1;
+    --primary-400: #818cf8;
+    --primary-300: #a5b4fc;
+    --success-500: #10b981;
+    --warning-500: #f59e0b;
+    --error-500: #f43f5e;
+
+    --slate-900: #0f172a;
+    --slate-800: #1e293b;
+    --slate-700: #334155;
+    --slate-600: #475569;
+    --slate-500: #64748b;
+    --slate-400: #94a3b8;
+    --slate-300: #cbd5e1;
+    --slate-200: #e2e8f0;
+    --slate-100: #f1f5f9;
+
+    /* Spacing */
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-5: 1.25rem;
+    --space-6: 1.5rem;
+    --space-8: 2rem;
+
+    /* Effects */
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    --radius-xl: 20px;
+    --radius-full: 9999px;
+
+    --glass-bg: rgba(30, 41, 59, 0.6);
+    --glass-border: rgba(255, 255, 255, 0.08);
+}
+
+/* ============================================
+   BASE
+   ============================================ */
+*,
+*::before,
+*::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: var(--font-body);
+    background: linear-gradient(180deg, var(--slate-900) 0%, #020617 100%);
+    color: var(--slate-100);
+    min-height: 100vh;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ============================================
+   CONTAINER
+   ============================================ */
+.app-container {
+    max-width: 500px;
+    margin: 0 auto;
+    padding: var(--space-6);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+}
+
+.ambient-bg {
+    position: fixed;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 600px;
+    height: 400px;
+    background: radial-gradient(ellipse at center, rgba(99, 102, 241, 0.15) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+}
+
+.welcome-content {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+    padding: var(--space-4) 0;
+}
+
+/* ============================================
+   LOGO SECTION
+   ============================================ */
+.logo-section {
+    text-align: center;
+    padding: var(--space-6) 0;
+}
+
+.logo-icon {
+    margin-bottom: var(--space-4);
+}
+
+.logo-text {
+    font-family: var(--font-display);
+    font-size: 1.8rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #fff 0%, var(--slate-400) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+}
+
+.pro-badge {
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    background: linear-gradient(135deg, var(--primary-500) 0%, #a855f7 100%);
+    padding: 3px 10px;
+    border-radius: var(--radius-full);
+    color: white;
+    -webkit-text-fill-color: white;
+}
+
+.version {
+    margin-top: var(--space-2);
+    font-size: 0.85rem;
+    color: var(--slate-500);
+}
+
+/* ============================================
+   FEATURES CARD
+   ============================================ */
+.features-card {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4);
+    backdrop-filter: blur(16px);
+}
+
+.feature-item {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+    padding: var(--space-3) 0;
+    border-bottom: 1px solid var(--glass-border);
+}
+
+.feature-item:last-child {
+    border-bottom: none;
+}
+
+.feature-icon {
+    font-size: 1.3rem;
+    flex-shrink: 0;
+}
+
+.feature-content {
+    flex: 1;
+}
+
+.feature-title {
+    font-weight: 600;
+    color: var(--slate-200);
+    margin-bottom: 2px;
+}
+
+.feature-desc {
+    font-size: 0.8rem;
+    color: var(--slate-500);
+}
+
+/* ============================================
+   STEPS CARD
+   ============================================ */
+.steps-card {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4);
+    backdrop-filter: blur(16px);
+}
+
+.steps-title {
+    font-family: var(--font-display);
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--slate-200);
+    margin-bottom: var(--space-3);
+}
+
+.steps-list {
+    padding-left: var(--space-5);
+    color: var(--slate-400);
+    font-size: 0.9rem;
+}
+
+.steps-list li {
+    padding: var(--space-2) 0;
+}
+
+.steps-list strong {
+    color: var(--primary-400);
+}
+
+/* ============================================
+   WARNING BOX
+   ============================================ */
+.warning-box {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.2);
+    border-radius: var(--radius-md);
+    font-size: 0.8rem;
+    color: var(--warning-500);
+}
+
+.warning-box svg {
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+
+/* ============================================
+   CTA BUTTON
+   ============================================ */
+.btn-cta {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    width: 100%;
+    padding: var(--space-4);
+    background: linear-gradient(135deg, var(--primary-500) 0%, #a855f7 100%);
+    color: white;
+    border: none;
+    border-radius: var(--radius-md);
+    font-family: var(--font-body);
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3);
+}
+
+.btn-cta:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
+}
+
+.btn-cta:active {
+    transform: translateY(0);
+}
+
+.btn-cta:focus-visible {
+    outline: 2px solid white;
+    outline-offset: 3px;
+}
+
+/* ============================================
+   FOOTER
+   ============================================ */
+.footer {
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--slate-600);
+    padding: var(--space-4) 0;
+}
+
+/* ============================================
+   REDUCED MOTION
+   ============================================ */
+@media (prefers-reduced-motion: reduce) {
+
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+    }
+}

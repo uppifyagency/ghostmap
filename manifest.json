@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ghost Map Pro",
-  "version": "9.13.0",
+  "version": "9.13.4",
   "description": "Extract business leads from Google Business Profiles with smart email discovery and export.",
   "icons": {
     "16": "icons/icon-16.png",
@@ -19,7 +19,8 @@
   ],
   "host_permissions": [
     "https://www.google.com/maps/*",
-    "https://*/*"
+    "https://*/*",
+    "http://*/*"
   ],
   "background": {
     "service_worker": "background/sw.js",

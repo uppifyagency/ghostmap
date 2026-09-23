@@ -766,11 +766,15 @@ function setupQueueCallbacks() {
         // Broadcast progress update
         // BG-5: use the multi-name display function so concurrent workers
         // are aggregated into one truthful UI string.
+        const qStatus = jobQueue.getStatus();
         broadcastMessage({
             action: 'scraping_progress',
             payload: {
                 current: completedEmailJobs,
                 total: totalEmailJobs,
+                pending: qStatus.pending,
+                failed: qStatus.failed,
+                isPaused: qStatus.isPaused,
                 currentItem: _currentBusinessNamesDisplay()
             }
         });
@@ -782,6 +786,23 @@ function setupQueueCallbacks() {
         // Record failure metrics
         performanceMonitor.recordJob(0, false);
         performanceMonitor.recordError(error.message || 'unknown');
+
+        // UX: permanent failures still count toward done/total so the bar
+        // advances while the queue drains (same scrape path — display only).
+        completedEmailJobs++;
+        _schedulePersistEmailProgress();
+        const qStatus = jobQueue.getStatus();
+        broadcastMessage({
+            action: 'scraping_progress',
+            payload: {
+                current: completedEmailJobs,
+                total: totalEmailJobs,
+                pending: qStatus.pending,
+                failed: qStatus.failed,
+                isPaused: qStatus.isPaused,
+                currentItem: _currentBusinessNamesDisplay() || `Failed: ${error?.message || 'unknown'}`
+            }
+        });
 
         // S8 FIX (2026-08-18): an email_scrape job that exhausted ALL its
         // retries because the domain circuit breaker never closed used to
@@ -1997,9 +2018,18 @@ async function startEmailScraping() {
             logger.warn(`Email scraping already in progress. ${queueStatus.pending} pending, ${queueStatus.active} active jobs.`);
             return { status: 'already_running', pending: queueStatus.pending, active: queueStatus.active };
         }
-        if (startAction === 'paused') {
-            logger.info(`Email scraping remains paused. ${queueStatus.pending} pending jobs.`);
-            return { status: 'paused', pending: queueStatus.pending, active: queueStatus.active };
+        if (startAction === 'resume_paused') {
+            jobQueue.resume();
+            startKeepAlive('email-scraping');
+            _startPhase2Heartbeat();
+            const resumedStatus = jobQueue.getStatus();
+            logger.info(`Email scraping resumed from pause. ${resumedStatus.pending} pending, ${resumedStatus.active} active.`);
+            return { status: 'resumed', pending: resumedStatus.pending, active: resumedStatus.active };
+        }
+        if (startAction === 'clear_pause_then_start') {
+            // Leftover isPaused with empty queue — clear flag, then fall through to fresh start.
+            jobQueue.resume();
+            logger.info('Cleared leftover pause flag before fresh email start.');
         }
         if (startAction === 'circuit_open') {
             logger.info(`Email scraping held by circuit breaker. ${queueStatus.pending} pending jobs.`);
@@ -2030,11 +2060,26 @@ async function startEmailScraping() {
         logger.info('Starting email scraping...');
         logger.info('>>> STARTING BATCH EMAIL EXTRACTION (New Script Logic) <<<');
 
+        // Overlap DB candidate query with offscreen bring-up so the UI ACK
+        // arrives before the 15–45s client timeout (false "Failed to start"
+        // toast while extraction still ran). Extraction path unchanged:
+        // jobs still only enqueue after both settle.
+        const offscreenReady = setupOffscreenDocument()
+            .then(() => {
+                logger.info('[OFFSCREEN] ✓ Document ready before job queue starts');
+                return true;
+            })
+            .catch((setupErr) => {
+                logger.warn('[OFFSCREEN] Setup failed, will use direct parsing fallback:', setupErr instanceof Error ? setupErr.message : String(setupErr));
+                return false;
+            });
+
         // Get businesses - this is async so it's fine
         const targets = await getBusinessesForEmailScraping();
         logger.info(`Found ${targets.length} businesses to scrape`);
 
         if (targets.length === 0) {
+            await offscreenReady.catch(() => {});
             broadcastMessage({
                 action: 'email_scraping_finished',
                 payload: { count: 0, message: 'No websites found to scrape.' }
@@ -2074,12 +2119,7 @@ async function startEmailScraping() {
         // BUG-FIX: Setup offscreen document BEFORE adding jobs
         // Previously this was fire-and-forget with .catch(), causing race condition
         // where jobs would start before offscreen was ready → "not responsive" errors
-        try {
-            await setupOffscreenDocument();
-            logger.info('[OFFSCREEN] ✓ Document ready before job queue starts');
-        } catch (setupErr) {
-            logger.warn('[OFFSCREEN] Setup failed, will use direct parsing fallback:', setupErr instanceof Error ? setupErr.message : String(setupErr));
-        }
+        await offscreenReady;
 
         // ⚡ KEY FIX: Add jobs in batches to prevent UI freeze
         // Return immediately, queue jobs in background
@@ -2205,16 +2245,26 @@ function yieldToMainThread() {
 }
 
 /**
- * Stop email scraping
+ * Pause email scraping (UI label: Pause). Jobs stay queued for Resume/Start.
  */
 function stopEmailScraping() {
     // M2-RACE1 FIX: Request cancellation so addJobsInBatches stops between batches
     jobQueue.requestCancellation();
     jobQueue.pause();
-    stopKeepAlive('email-scraping');
-    _stopPhase2Heartbeat();  // UX-1: stop heartbeat on user-requested pause
+    const status = jobQueue.getStatus();
+    const hasWork = (status.pending || 0) + (status.active || 0) + (status.backoff || 0) > 0;
+    if (hasWork) {
+        // Keep heartbeat + keepalive while paused with work left so the UI
+        // still shows done/total, pending, and "Paused" (scrape path unchanged).
+        startKeepAlive('email-scraping');
+        _startPhase2Heartbeat();
+        _emitPhase2Heartbeat();
+    } else {
+        stopKeepAlive('email-scraping');
+        _stopPhase2Heartbeat();
+    }
     logger.info('Email scraping paused');
-    return { status: 'paused' };
+    return { status: 'paused', pending: status.pending, active: status.active };
 }
 
 /**

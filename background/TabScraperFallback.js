@@ -26,6 +26,7 @@ import { CONFIG } from '../lib/config.js';
 import { extractPartitaIvaWithRaw } from '../lib/partitaIva.js';
 import { logger, sleep } from '../lib/utils.js';
 import { getStatistics } from '../lib/Statistics.js';
+import { createUnfocusedScrapeWindow } from '../lib/scrapeWindow.js';
 // §3.D.3 CYCLE BREAK (2026-06-11): this module must NOT import the
 // orchestrator (email-scraper-v2) back — that was the only import cycle in
 // the codebase (flagged by eslint import/no-cycle). The HIGH-003 circuit
@@ -878,17 +879,18 @@ async function createTab(url, config) {
         // B5-3 fix: popup window instead of tab in user's main window.
         // 2026-05-15 FIX #3: Chrome rejects off-screen bounds (50% must
         // be visible) AND throttles JS in minimized windows. Landing
-        // zone: 200×200 at (0,0), focused:false. See sibling fix in
-        // website-extractor.js for full reasoning.
-        const popupWindow = await chrome.windows.create({
+        // zone: 200×200 at (0,0), focused:false. Same as Area Search:
+        // restoreFocus:false — re-focusing the last Chrome window (Ghost Map
+        // host) steals the user from Cursor/other apps; Chrome cannot restore
+        // OS focus outside Chrome. Extraction behavior unchanged.
+        const popupWindow = await createUnfocusedScrapeWindow({
             url,
             type: 'popup',
-            focused: false,
             left: 0,
             top: 0,
             width: 200,
             height: 200
-        });
+        }, { restoreFocus: false });
 
         const innerTab = popupWindow.tabs?.[0];
         if (!innerTab?.id) {

@@ -515,6 +515,7 @@ async function openAreaSearchModal() {
 }
 
 function closeAreaSearchModal() {
+    stopAreaSearchLiveStats();
     document.getElementById('areaSearchModal').style.display = 'none';
     // UI-2 FIX (2026-05-27): clear pending warning-banner auto-hide timer
     // so it does not fire after the modal closes. The pre-fix timer was
@@ -527,12 +528,38 @@ function closeAreaSearchModal() {
     }
 }
 
-function showConfigView() {
-    document.getElementById('areaSearchConfig').style.display = 'block';
-    document.getElementById('areaSearchProgress').style.display = 'none';
-    document.getElementById('startAreaSearchBtn').style.display = 'inline-flex';
-    document.getElementById('pauseAreaSearchBtn').style.display = 'none';
-    document.getElementById('cancelAreaSearchBtn').textContent = 'Cancel';
+// Live stats poll — UI only. Does not change scrape behavior. Progress used
+// to update only after each batch finished, so long batches looked "frozen".
+let _areaSearchLiveStatsTimer = null;
+const AREA_SEARCH_LIVE_STATS_MS = 1000;
+
+function stopAreaSearchLiveStats() {
+    if (_areaSearchLiveStatsTimer !== null) {
+        clearInterval(_areaSearchLiveStatsTimer);
+        _areaSearchLiveStatsTimer = null;
+    }
+}
+
+function startAreaSearchLiveStats() {
+    stopAreaSearchLiveStats();
+    const tick = async () => {
+        try {
+            const status = await chrome.runtime.sendMessage({ action: 'get_area_search_status' });
+            if (!status) return;
+            if (status.isRunning || status.isPaused) {
+                updateProgressUI(status);
+            } else if (status.total > 0 && status.current >= status.total) {
+                // Run finished between polls — keep final numbers visible until complete handler.
+                updateProgressUI(status);
+                stopAreaSearchLiveStats();
+            }
+        } catch (err) {
+            // SW brief eviction — keep polling; next tick usually recovers.
+            console.debug('[AreaSearchModal] live stats tick skipped:', err?.message);
+        }
+    };
+    tick();
+    _areaSearchLiveStatsTimer = setInterval(tick, AREA_SEARCH_LIVE_STATS_MS);
 }
 
 function showProgressView() {
@@ -541,6 +568,16 @@ function showProgressView() {
     document.getElementById('startAreaSearchBtn').style.display = 'none';
     document.getElementById('pauseAreaSearchBtn').style.display = 'inline-flex';
     document.getElementById('cancelAreaSearchBtn').textContent = 'Stop';
+    startAreaSearchLiveStats();
+}
+
+function showConfigView() {
+    stopAreaSearchLiveStats();
+    document.getElementById('areaSearchConfig').style.display = 'block';
+    document.getElementById('areaSearchProgress').style.display = 'none';
+    document.getElementById('startAreaSearchBtn').style.display = 'inline-flex';
+    document.getElementById('pauseAreaSearchBtn').style.display = 'none';
+    document.getElementById('cancelAreaSearchBtn').textContent = 'Cancel';
 }
 
 function updateRadiusHint() {
@@ -641,6 +678,16 @@ async function handleStart() {
 
         if (response?.status === 'started') {
             startedSuccessfully = true;
+            // Seed totals immediately so the UI is not blank until the first batch ends.
+            updateProgressUI({
+                percent: 0,
+                current: 0,
+                total: response.totalSearches || 0,
+                currentBatch: 0,
+                totalBatches: response.batches || 0,
+                elapsed: '0:00',
+                remaining: '--:--'
+            });
             showProgressView();
             document.getElementById('parallelInfo').textContent =
                 turboEnabled ? `${parallelTabs} tabs` : '1 tab';
@@ -709,6 +756,7 @@ function updateProgressUI(progress) {
 
 function handleComplete(result) {
     console.log('[AREA SEARCH] Complete!', result);
+    stopAreaSearchLiveStats();
 
     // Close modal first to show main UI
     closeAreaSearchModal();

@@ -18,6 +18,15 @@ console.log('[CONTENT SCRIPT LOADER] Loading main content script...');
         await import(src);
         console.log('[CONTENT SCRIPT LOADER] ✓ Main content script loaded successfully');
     } catch (error) {
+        // Extension reload/update invalidates old tab contexts — expected, not a scrape bug.
+        // console.error would light chrome://extensions Errors; keep real load failures loud.
+        const msg = error?.message || String(error || '');
+        const isContextDead = msg.includes('Extension context invalidated');
+        if (isContextDead) {
+            // eslint-disable-next-line no-console
+            console.debug('[CONTENT SCRIPT LOADER] context invalidated (tab stale after reload)');
+            return;
+        }
         console.error('[CONTENT SCRIPT LOADER] ✗ Failed to load main content script:', error);
         console.error('[CONTENT SCRIPT LOADER] Error details:', {
             message: error.message,

@@ -1,0 +1,14 @@
+﻿# Ghost Map Pro — Install
+
+1. Open Chrome → chrome://extensions
+2. Enable Developer mode
+3. Click Load unpacked
+4. Select this extension folder
+5. If already loaded: click Reload on Ghost Map Pro
+
+Full instructions for non-technical users: USER_GUIDE.md (also in the project root)
+
+Version: 9.13.3
+- Pause/resume + progress clarity
+- Scrape popups restore your window (less interruption)
+- Area Search / website / email background focus improvements

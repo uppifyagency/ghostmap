@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ghost Map Pro — User Guide</title>
+  <style>
+    :root {
+      --bg: #f6f4ef;
+      --ink: #1c1f1d;
+      --muted: #5c6560;
+      --card: #ffffff;
+      --line: #d9d4c8;
+      --accent: #2e7d5b;
+      --accent-soft: #e8f4ee;
+      --warn: #8a5a12;
+      --warn-bg: #fff6e5;
+      --radius: 10px;
+      --max: 820px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(ellipse at top left, #efe8d8 0%, transparent 50%),
+        var(--bg);
+      line-height: 1.55;
+    }
+    .wrap { max-width: var(--max); margin: 0 auto; padding: 40px 20px 80px; }
+    header.hero {
+      margin-bottom: 36px;
+      padding-bottom: 24px;
+      border-bottom: 2px solid var(--line);
+    }
+    header.hero h1 {
+      font-size: 2rem;
+      margin: 0 0 8px;
+      letter-spacing: -0.02em;
+    }
+    header.hero .meta {
+      color: var(--muted);
+      font-family: system-ui, sans-serif;
+      font-size: 0.9rem;
+    }
+    header.hero p.lead {
+      margin: 16px 0 0;
+      font-size: 1.1rem;
+      max-width: 42ch;
+    }
+    nav.toc {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      margin-bottom: 32px;
+      font-family: system-ui, sans-serif;
+      font-size: 0.92rem;
+    }
+    nav.toc h2 { margin: 0 0 10px; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+    nav.toc ol { margin: 0; padding-left: 1.2rem; }
+    nav.toc a { color: var(--accent); text-decoration: none; }
+    nav.toc a:hover { text-decoration: underline; }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 22px 24px 26px;
+      margin-bottom: 18px;
+    }
+    section h2 {
+      margin: 0 0 12px;
+      font-size: 1.35rem;
+      color: var(--accent);
+    }
+    section h3 { margin: 20px 0 8px; font-size: 1.05rem; }
+    p, li { font-family: system-ui, -apple-system, sans-serif; font-size: 0.95rem; }
+    p { margin: 0 0 12px; }
+    ul, ol { margin: 0 0 12px; padding-left: 1.25rem; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: system-ui, sans-serif;
+      font-size: 0.88rem;
+      margin: 12px 0 8px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: var(--accent-soft); }
+    .callout {
+      background: var(--warn-bg);
+      border-left: 4px solid var(--warn);
+      padding: 12px 14px;
+      margin: 14px 0;
+      font-family: system-ui, sans-serif;
+      font-size: 0.9rem;
+      border-radius: 0 6px 6px 0;
+    }
+    .example {
+      background: var(--accent-soft);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin: 14px 0;
+      font-family: system-ui, sans-serif;
+      font-size: 0.9rem;
+    }
+    .example strong { color: var(--accent); }
+    code {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 0.85em;
+      background: #eeeae2;
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+    footer {
+      margin-top: 28px;
+      color: var(--muted);
+      font-family: system-ui, sans-serif;
+      font-size: 0.85rem;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <h1>Ghost Map Pro</h1>
+      <div class="meta">User Guide · Version 9.13.4 · For non-technical users</div>
+      <p class="lead">Find business leads from Google Maps, collect websites and emails, then export them — step by step.</p>
+    </header>
+
+    <nav class="toc">
+      <h2>Contents</h2>
+      <ol>
+        <li><a href="#install">Install</a></li>
+        <li><a href="#picture">The big picture</a></li>
+        <li><a href="#counts">Understanding the numbers</a></li>
+        <li><a href="#discover">Phase 1 — Discover</a></li>
+        <li><a href="#extract">Phase 2 — Extract emails</a></li>
+        <li><a href="#export">Phase 3 — Export</a></li>
+        <li><a href="#settings">Settings</a></li>
+        <li><a href="#workflows">Example workflows</a></li>
+        <li><a href="#troubleshoot">Troubleshooting</a></li>
+        <li><a href="#glossary">Glossary</a></li>
+      </ol>
+    </nav>
+
+    <section id="install">
+      <h2>1. Install (one time)</h2>
+      <ol>
+        <li>Open <strong>Google Chrome</strong>.</li>
+        <li>Go to <code>chrome://extensions</code>.</li>
+        <li>Turn <strong>Developer mode</strong> ON (top right).</li>
+        <li>Click <strong>Load unpacked</strong>.</li>
+        <li>Choose the project’s <code>extension</code> folder.</li>
+        <li>Pin <strong>Ghost Map Pro</strong> from Chrome’s puzzle icon.</li>
+        <li>Open <a href="https://www.google.com/maps" target="_blank" rel="noopener">Google Maps</a>.</li>
+        <li>Click the Ghost Map icon → open the <strong>side panel</strong>.</li>
+      </ol>
+      <div class="callout">After any update, open <code>chrome://extensions</code> and click <strong>Reload</strong> on Ghost Map Pro.</div>
+    </section>
+
+    <section id="picture">
+      <h2>2. The big picture — 3 phases</h2>
+      <table>
+        <tr><th>Phase</th><th>Name</th><th>What it does</th></tr>
+        <tr><td>1</td><td><strong>Discover</strong></td><td>Find businesses (Area Search or Monitor Maps)</td></tr>
+        <tr><td>2</td><td><strong>Extract</strong></td><td>Visit websites and collect emails</td></tr>
+        <tr><td>3</td><td><strong>Export</strong></td><td>Download CSV, Markdown, or filtered Excel</td></tr>
+      </table>
+      <p>Always use them in order for best results.</p>
+    </section>
+
+    <section id="counts">
+      <h2>3. Understanding the numbers</h2>
+      <table>
+        <tr><th>What you see</th><th>What it means</th></tr>
+        <tr><td>Businesses Found</td><td>Unique companies saved</td></tr>
+        <tr><td>Websites</td><td>How many have a website URL</td></tr>
+        <tr><td>Email progress e.g. 12 / 19</td><td>Progress for <em>this email run</em> (queued websites), not total businesses</td></tr>
+      </table>
+      <div class="example">
+        <strong>Example:</strong> Area Search finds <strong>100</strong> businesses. Only <strong>70</strong> have websites.
+        Email extraction will queue about <strong>70</strong> — not 100. That is normal.
+      </div>
+    </section>
+
+    <section id="discover">
+      <h2>4. Phase 1 — Discover</h2>
+      <h3>Area Search (whole city)</h3>
+      <ol>
+        <li>Click <strong>Launch Area Search</strong>.</li>
+        <li>Enter city (e.g. <code>Melbourne, Australia</code>).</li>
+        <li>Set radius in km — <strong>maximum about 200</strong>. Do not use huge values like 15000.</li>
+        <li>Enter keywords (one per line), e.g. <code>roofing</code>.</li>
+        <li>Leave Turbo on; Parallel Tabs around <strong>8</strong> is a good start.</li>
+        <li>Click <strong>Start Turbo Search</strong> and watch live progress.</li>
+      </ol>
+      <div class="callout">Maps helper windows may open in the background. You should be able to keep working in other apps.</div>
+
+      <h3>Monitor Maps (manual)</h3>
+      <p>Search on Maps yourself → <strong>Start Monitoring</strong> → scroll results slowly → <strong>Stop</strong>. Good for small areas.</p>
+
+      <h3>Extract Websites</h3>
+      <p>Use when many businesses have no website yet. Click <strong>Extract Websites</strong>; use Pause if needed.</p>
+
+      <div class="example">
+        <strong>New city tip:</strong> Before Sydney after Melbourne, click <strong>Reset All</strong> first so old leads do not mix in.
+      </div>
+    </section>
+
+    <section id="extract">
+      <h2>5. Phase 2 — Extract emails</h2>
+      <ol>
+        <li>Open the <strong>Extract</strong> tab.</li>
+        <li>Click <strong>Start Extraction</strong>.</li>
+        <li>Use <strong>Pause</strong> / <strong>Resume</strong> anytime — progress is kept.</li>
+        <li>Use <strong>Retry Failed</strong> later for sites that blocked or timed out.</li>
+      </ol>
+      <p>Not every website publishes an email. A rising “failed” count is often normal.</p>
+      <div class="callout">Tiny website windows may flash briefly. Ghost Map should not keep pulling focus back to Chrome while you work elsewhere.</div>
+    </section>
+
+    <section id="export">
+      <h2>6. Phase 3 — Export</h2>
+      <table>
+        <tr><th>Button</th><th>What you get</th><th>When to use it</th></tr>
+        <tr><td><strong>Export CSV</strong></td><td>Full raw spreadsheet</td><td>All columns in Excel / Google Sheets</td></tr>
+        <tr><td><strong>Export MD</strong></td><td>Markdown email list</td><td>Quick text list</td></tr>
+        <tr><td><strong>Export xlsx filtered</strong></td><td>Multi-sheet Excel ledger</td><td>Ready-to-work outreach lists</td></tr>
+        <tr><td><strong>View Failed</strong></td><td>Problem rows</td><td>Investigate issues</td></tr>
+        <tr><td><strong>Reset All</strong></td><td>Clears all saved data</td><td>Starting a new city</td></tr>
+      </table>
+
+      <h3>What “Export xlsx filtered” puts in Excel</h3>
+      <table>
+        <tr><th>Sheet</th><th>Who is on it</th></tr>
+        <tr><td>Dashboard</td><td>Summary counts and categories</td></tr>
+        <tr><td>Owner Leads</td><td>Website + personal-looking email (e.g. john@…)</td></tr>
+        <tr><td>General Leads</td><td>Website + generic email (info@, sales@, admin@…)</td></tr>
+        <tr><td>Needs Follow-Up</td><td>Website but no email yet</td></tr>
+        <tr><td>No Website</td><td>No website URL</td></tr>
+        <tr><td>Duplicate Leads</td><td>Same phone, email, or website domain as a stronger lead</td></tr>
+      </table>
+      <div class="example">
+        <strong>Example:</strong> You have 515 businesses. Click <strong>Export xlsx filtered</strong>.
+        Excel opens with a Dashboard plus Owner / General / Follow-Up / No Website / Duplicates tabs —
+        same logic as the offline “CSV → Excel Ledger” tool, built into Ghost Map.
+      </div>
+      <p><strong>Export CSV</strong> and <strong>Export MD</strong> still work exactly as before.</p>
+    </section>
+
+    <section id="settings">
+      <h2>7. Settings (gear icon)</h2>
+      <table>
+        <tr><th>Setting</th><th>Meaning</th><th>Suggested</th></tr>
+        <tr><td>Requests per Minute</td><td>How fast emails run</td><td>10–15</td></tr>
+        <tr><td>Max Concurrent Requests</td><td>How many sites at once</td><td>3–5</td></tr>
+        <tr><td>Request Timeout</td><td>Wait on slow sites</td><td>30 seconds</td></tr>
+      </table>
+      <p>Opportuni tab is optional cloud sync — leave <strong>OFF</strong> unless you use it.</p>
+    </section>
+
+    <section id="workflows">
+      <h2>8. Example workflows</h2>
+      <h3>A) Full city list (most common)</h3>
+      <ol>
+        <li>Reset All (if new city).</li>
+        <li>Area Search — city + keywords + radius ≤ 200.</li>
+        <li>Wait for finish (watch live %).</li>
+        <li>Extract Websites if needed.</li>
+        <li>Start Extraction for emails.</li>
+        <li>Export CSV and/or Export xlsx filtered.</li>
+      </ol>
+      <h3>B) Quick one Maps search</h3>
+      <ol>
+        <li>Search on Maps yourself.</li>
+        <li>Start Monitoring → scroll → Stop.</li>
+        <li>Extract → Export.</li>
+      </ol>
+    </section>
+
+    <section id="troubleshoot">
+      <h2>9. Troubleshooting</h2>
+      <table>
+        <tr><th>Problem</th><th>Try this</th></tr>
+        <tr><td>Extension missing</td><td>Load unpacked → <code>extension</code> folder</td></tr>
+        <tr><td>Area Search finds nothing</td><td>Check city name; radius ≤ 200; simpler keywords</td></tr>
+        <tr><td>Email won’t start</td><td>Run Extract Websites first</td></tr>
+        <tr><td>Stuck on Pause</td><td>Click Resume</td></tr>
+        <tr><td>Chrome feels slow</td><td>Lower Parallel Tabs / Concurrent Requests</td></tr>
+        <tr><td>Red Errors badge</td><td>Often harmless; Clear all after Reload if needed</td></tr>
+        <tr><td>Excel button fails</td><td>Reload extension; need at least one saved business</td></tr>
+      </table>
+    </section>
+
+    <section id="glossary">
+      <h2>10. Glossary</h2>
+      <table>
+        <tr><th>Term</th><th>Plain meaning</th></tr>
+        <tr><td>Lead</td><td>One business saved from Maps</td></tr>
+        <tr><td>Radius</td><td>How far around the city to search (km)</td></tr>
+        <tr><td>Turbo / Parallel Tabs</td><td>Faster Area Search using several Maps windows</td></tr>
+        <tr><td>Queue</td><td>Websites waiting for email extraction</td></tr>
+        <tr><td>CSV</td><td>Raw spreadsheet export</td></tr>
+        <tr><td>XLSX filtered</td><td>Sorted Excel ledger for outreach</td></tr>
+        <tr><td>Owner email</td><td>Personal-looking address (not info@ / sales@)</td></tr>
+      </table>
+    </section>
+
+    <footer>
+      Ghost Map Pro · Load the <code>extension</code> folder in Chrome · See also USER_GUIDE.md
+    </footer>
+  </div>
+</body>
+</html>

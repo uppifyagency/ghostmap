@@ -319,6 +319,9 @@
                             <span id="emailProgressStats">0 / 0</span>
                             <span id="emailProgressETA">—</span>
                         </div>
+                        <div class="progress-context" id="emailProgressContext">
+                            Progress = websites queued for email (not area-search lead count)
+                        </div>
                         <div class="progress-current" id="emailCurrentItem" style="display: none;">
                             <span class="current-arrow">↳</span>
                             <span class="current-text" id="emailCurrentText">Processing...</span>
@@ -531,6 +534,17 @@
                         </svg>
                         Export MD
                     </button>
+                    <button class="btn btn-secondary" id="exportXlsxFilteredBtn" title="Download filtered Excel ledger (Owner / General / Follow-Up / No Website / Duplicates)">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                            <polyline points="14 2 14 8 20 8" />
+                            <line x1="8" y1="13" x2="16" y2="13" />
+                            <line x1="8" y1="17" x2="16" y2="17" />
+                            <line x1="10" y1="9" x2="10" y2="9" />
+                        </svg>
+                        Export xlsx filtered
+                    </button>
                 </div>
 
                 <!-- Additional Actions -->
@@ -697,6 +711,9 @@
              and sidepanel for SW-eviction-safe message delivery. -->
         <script src="messaging.js"></script>
         <script src="animations.js"></script>
+        <script src="vendor/papaparse.min.js"></script>
+        <script src="vendor/exceljs.min.js"></script>
+        <script src="csv-to-excel-ledger.js"></script>
         <script type="module" src="failed-modal.js"></script>
         <script src="storage-modal.js"></script>
         <script src="area-search-modal.js"></script>

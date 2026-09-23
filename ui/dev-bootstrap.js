@@ -28,7 +28,10 @@
     let buffer = [];
     let timer = null;
     let fails = 0;
-    let alive = true;
+    // Stay silent until a probe confirms the local sink is up. Unpacked
+    // installs always look "dev", but 127.0.0.1:9876 is usually absent —
+    // probing first avoids ERR_CONNECTION_REFUSED + Errors-button noise.
+    let alive = false;
 
     function safeStr(v) {
         if (typeof v === 'string') return v;
@@ -67,16 +70,14 @@
             fails++;
             if (fails >= KILL_AFTER_FAILS) {
                 alive = false;
-                // Use the ORIGINAL console.warn captured before patching,
-                // to avoid recursing through the patched method.
-                if (typeof window.__gmpOrigConsoleWarn === 'function') {
-                    window.__gmpOrigConsoleWarn('[devLogger] sink unreachable — disabling bridge until reload');
-                }
+                // Silent disable — do not console.warn (Chrome surfaces that
+                // on chrome://extensions → Errors for unpacked installs).
             }
         }
     }
 
-    // Monkey-patch console.* — keep originals callable.
+    // Monkey-patch console.* — keep originals callable. push() is a no-op
+    // until the probe below flips alive=true.
     try {
         for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
             const orig = console[level];
@@ -110,5 +111,24 @@
         } catch { /* never throw */ }
     });
 
-    push('info', [`[devLogger] online (source=${SOURCE})`]);
+    // Probe once; only forward logs when the sink answers.
+    (async function probeSink() {
+        try {
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+            try {
+                await fetch(ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: '[]',
+                    signal: ctrl.signal
+                });
+            } finally { clearTimeout(to); }
+            alive = true;
+            fails = 0;
+            push('info', [`[devLogger] online (source=${SOURCE})`]);
+        } catch {
+            // Sink absent — stay silent for this page lifetime.
+        }
+    })();
 })();

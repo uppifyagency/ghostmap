@@ -10,6 +10,7 @@
  */
 
 import { logger } from '../lib/utils.js';
+import { createUnfocusedScrapeWindow } from '../lib/scrapeWindow.js';
 import {
     classifyExtractionOutcome,
     GOOGLE_BLOCKED_ERROR_CODE
@@ -469,15 +470,17 @@ async function extractWebsiteFromGMB(googleMapsUrl) {
         // throttle because the window is normal-state. Trade-off:
         // a small popup briefly appears in the top-left corner per
         // business. Better than a broken fallback.
-        const popupWindow = await chrome.windows.create({
+        // Pragmatic landing zone: small 200×200 popup at (0,0). JS runs at
+        // full throttle (normal state). restoreFocus:false — same as Area
+        // Search; do not yank Ghost Map Chrome to the front after each popup.
+        const popupWindow = await createUnfocusedScrapeWindow({
             url: googleMapsUrl,
             type: 'popup',
-            focused: false,
             left: 0,
             top: 0,
             width: 200,
             height: 200
-        });
+        }, { restoreFocus: false });
         windowId = popupWindow.id;
         tabId = popupWindow.tabs?.[0]?.id;
 

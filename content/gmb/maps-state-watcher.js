@@ -1100,14 +1100,16 @@
                     // state. location.replace() doesn't add a history entry,
                     // so the back button still goes where the user expects.
                     const cleanUrl = location.origin + location.pathname + location.hash;
+                    // Expected SPA recovery — debug only (console.warn lights
+                    // chrome://extensions Errors on unpacked installs). Reload below unchanged.
                     // eslint-disable-next-line no-console
-                    console.warn(
+                    console.debug(
                         '[GhostMap state-watcher] anemic state (' +
                         Math.round(json.length / 1024) +
                         'KB) on ' + location.pathname +
                         ' — reloading without SPA-entry query params to repopulate APP_INITIALIZATION_STATE.'
                     );
-                    // Defer the navigation one tick so the warn flushes
+                    // Defer the navigation one tick so the log flushes
                     setTimeout(() => location.replace(cleanUrl), 50);
                 } catch { /* never throw from auto-reload */ }
             }, 1500);

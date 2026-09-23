@@ -657,7 +657,7 @@ export class DOMObserver {
                         chrome.runtime.sendMessage({
                             action: 'business_enrichment',
                             payload: { googleMapsUrl: business.googleMapsUrl, fields: { phone: business.phone } },
-                        });
+                        }).catch(() => { /* SW/UI closed — acceptable */ });
                     } catch (err) {
                         logger.debug('[R-DETAIL-FETCH] recovered-phone enrichment send failed:', err?.message);
                     }
@@ -765,7 +765,7 @@ export class DOMObserver {
                             googleMapsUrl: business.googleMapsUrl,
                             fields,
                         },
-                    });
+                    }).catch(() => { /* SW/UI closed — acceptable */ });
                 } catch (err) {
                     logger.debug('[R-DETAIL-FETCH] sendMessage failed:', err?.message);
                 }

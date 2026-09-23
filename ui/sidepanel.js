@@ -19,6 +19,7 @@ const state = {
     currentPhase: 1,
     isMonitoring: false,
     isExtractingEmails: false,
+    isEmailExtractionPaused: false,
     isExtractingWebsites: false,
     isWebsiteExtractionPaused: false,  // FIX: Track pause state for resume toggle
     activityExpanded: false,
@@ -27,6 +28,7 @@ const state = {
         withEmail: 0,
         withWebsite: 0,
         withPhone: 0,
+        pending: 0,
         queue: 0,
         failed: 0,
         successRate: 0,
@@ -100,6 +102,7 @@ const elements = {
     emailProgressStats: document.getElementById('emailProgressStats'),
     emailProgressETA: document.getElementById('emailProgressETA'),
     emailProgressLabel: document.getElementById('emailProgressLabel'),
+    emailProgressContext: document.getElementById('emailProgressContext'),
     emailCurrentItem: document.getElementById('emailCurrentItem'),
     emailCurrentText: document.getElementById('emailCurrentText'),
     emailShimmer: document.getElementById('emailShimmer'),
@@ -146,6 +149,7 @@ const elements = {
     previewPhones: document.getElementById('previewPhones'),
     exportCsvBtn: document.getElementById('exportCsvBtn'),
     exportMdBtn: document.getElementById('exportMdBtn'),
+    exportXlsxFilteredBtn: document.getElementById('exportXlsxFilteredBtn'),
     viewFailedBtn: document.getElementById('viewFailedBtn'),
     failedBadge: document.getElementById('failedBadge'),
     resetBtn: document.getElementById('resetBtn'),
@@ -371,9 +375,9 @@ function setupEventListeners() {
         elements.goToExtractBtn.addEventListener('click', () => switchPhase(2));
     }
 
-    // Phase 2: Extract
+    // Phase 2: Extract — Pause button toggles pause/resume
     elements.emailBtn.addEventListener('click', startEmailScraping);
-    elements.stopEmailBtn.addEventListener('click', stopEmailScraping);
+    elements.stopEmailBtn.addEventListener('click', toggleEmailPauseResume);
     if (elements.goToExportBtn) {
         elements.goToExportBtn.addEventListener('click', () => switchPhase(3));
     }
@@ -390,6 +394,7 @@ function setupEventListeners() {
     // Phase 3: Export
     elements.exportCsvBtn.addEventListener('click', exportCSV);
     elements.exportMdBtn.addEventListener('click', exportMD);
+    elements.exportXlsxFilteredBtn?.addEventListener('click', exportXlsxFiltered);
     // Note: viewFailedBtn click is handled by failed-modal.js
     elements.resetBtn.addEventListener('click', confirmReset);
 
@@ -653,7 +658,14 @@ async function startWebsiteExtraction() {
         }
 
     } catch (error) {
-        console.error('[GhostMap] Website extraction failed:', error);
+        // MESSAGE_TIMEOUT is common while SW is busy/waking during Area Search —
+        // toast still informs the user; avoid console.error (Errors badge noise).
+        const msg = error?.message || '';
+        if (msg.includes('MESSAGE_TIMEOUT')) {
+            console.debug('[GhostMap] Website extraction timed out (background busy):', msg);
+        } else {
+            console.error('[GhostMap] Website extraction failed:', error);
+        }
         showToast('Website extraction failed', 'error');
         elements.extractWebsitesBtn.disabled = false;
         elements.extractWebsitesBtn.innerHTML = `
@@ -707,6 +719,12 @@ function updateWebsiteProgress(progress) {
 // ============================================
 async function startEmailScraping() {
     try {
+        // If already paused with work left, Resume instead of a fresh start.
+        if (state.isEmailExtractionPaused) {
+            await resumeEmailScraping();
+            return;
+        }
+
         elements.emailBtn.disabled = true;
         elements.emailBtn.innerHTML = `
             <div class="loading-spinner"></div>
@@ -714,13 +732,17 @@ async function startEmailScraping() {
 
         elements.emailShimmer.parentElement.classList.add('active');
 
-        const response = await sendMessageWithTimeout({ action: 'start_email_scraping' });
+        // Email start awaits DB + offscreen setup before ACK. Default 15s
+        // UI timeout raced that path and showed "Failed to start" while the
+        // SW kept extracting — same scrape, false error toast. Allow longer.
+        const response = await sendMessageWithTimeout({ action: 'start_email_scraping' }, 45000);
 
         // FIX: Handle no_targets response explicitly
         if (response?.status === 'no_targets') {
             showToast('📭 No websites found to scrape. Run "Extract Websites" first.', 'warning');
             addActivity({ name: 'Email extraction', status: 'warning', detail: 'no websites' });
             // Reset button state
+            state.isEmailExtractionPaused = false;
             elements.emailBtn.disabled = false;
             elements.emailBtn.innerHTML = `
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -731,12 +753,18 @@ async function startEmailScraping() {
             return;
         }
 
-        if (response?.status === 'paused' || response?.status === 'circuit_open') {
-            state.isExtractingEmails = false;
-            updateEmailExtractionUI(false);
-            showToast(response.status === 'paused'
-                ? 'Email extraction is paused'
-                : 'Email extraction paused by circuit breaker', 'warning');
+        if (response?.status === 'circuit_open') {
+            state.isExtractingEmails = true;
+            state.isEmailExtractionPaused = true;
+            updateEmailExtractionUI(true);
+            showToast('Email extraction paused by circuit breaker', 'warning');
+            return;
+        }
+
+        // Background now auto-resumes paused queues; keep UI in sync if we
+        // still receive a legacy paused ACK.
+        if (response?.status === 'paused') {
+            await resumeEmailScraping();
             return;
         }
 
@@ -744,7 +772,11 @@ async function startEmailScraping() {
             || response.status === 'resumed'
             || response.status === 'already_running')) {
             state.isExtractingEmails = true;
+            state.isEmailExtractionPaused = false;
             updateEmailExtractionUI(true);
+            if (typeof response.count === 'number' && response.count > 0) {
+                updateEmailProgressContext(response.count);
+            }
             showToast(response.status === 'resumed'
                 ? '📧 Email extraction resumed'
                 : '📧 Email extraction started', 'success');
@@ -754,17 +786,33 @@ async function startEmailScraping() {
                 detail: response.status === 'resumed' ? 'resumed' : 'started'
             });
 
-            // If already running, try to resume
+            // If already running, try to resume (covers active+paused race)
             if (response.status === 'already_running') {
                 await sendMessageWithTimeout({ action: 'resume_email_scraping' });
+                state.isEmailExtractionPaused = false;
+                updateEmailExtractionUI(true);
             }
-        } else {
-            throw new Error(response?.error || 'Failed to start');
+            return;
         }
+
+        // SW channel timeout ACK while start is still finishing — confirm
+        // via queue before treating it as a real failure.
+        if (response?.status === 'timeout' && await isEmailExtractionActive()) {
+            markEmailExtractionStartedUi('started');
+            return;
+        }
+
+        throw new Error(response?.error || 'Failed to start');
 
     } catch (error) {
         console.error('[GhostMap] Email extraction failed:', error);
+        // Race: UI gave up waiting, but SW already queued jobs / is scraping.
+        if (await isEmailExtractionActive()) {
+            markEmailExtractionStartedUi('started');
+            return;
+        }
         showToast('Failed to start email extraction', 'error');
+        state.isEmailExtractionPaused = false;
         elements.emailBtn.disabled = false;
         elements.emailBtn.innerHTML = `
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -775,15 +823,121 @@ async function startEmailScraping() {
     }
 }
 
-async function stopEmailScraping() {
+/** True when the SW already has email-scrape work in flight (pending/active). */
+async function isEmailExtractionActive() {
     try {
-        await sendMessageWithTimeout({ action: 'stop_email_scraping' });
-        state.isExtractingEmails = false;
-        updateEmailExtractionUI(false);
-        showToast('Email extraction paused', 'success');
-    } catch (error) {
-        console.error('[GhostMap] Stop email scraping failed:', error);
+        const q = await sendMessageWithTimeout({ action: 'get_queue_status' }, 5000);
+        if (!q) return false;
+        const pending = q.pending || 0;
+        const active = q.active || 0;
+        return pending + active > 0 || q.isProcessing === true || q.isPaused === true;
+    } catch {
+        return false;
     }
+}
+
+function markEmailExtractionStartedUi(detail = 'started') {
+    state.isExtractingEmails = true;
+    state.isEmailExtractionPaused = false;
+    updateEmailExtractionUI(true);
+    showToast('📧 Email extraction started', 'success');
+    addActivity({
+        name: 'Email extraction',
+        status: 'success',
+        detail
+    });
+}
+
+async function toggleEmailPauseResume() {
+    if (state.isEmailExtractionPaused) {
+        await resumeEmailScraping();
+    } else {
+        await pauseEmailScraping();
+    }
+}
+
+async function pauseEmailScraping() {
+    try {
+        const response = await sendMessageWithTimeout({ action: 'stop_email_scraping' });
+        state.isExtractingEmails = true;
+        state.isEmailExtractionPaused = true;
+        updateEmailExtractionUI(true);
+        const pending = response?.pending;
+        showToast(
+            typeof pending === 'number'
+                ? `Email extraction paused (${pending} left in queue)`
+                : 'Email extraction paused',
+            'success'
+        );
+        if (elements.emailCurrentItem) {
+            elements.emailCurrentItem.style.display = 'flex';
+            elements.emailCurrentText.textContent = typeof pending === 'number'
+                ? `Paused — ${pending} remaining in queue`
+                : 'Paused';
+        }
+    } catch (error) {
+        console.error('[GhostMap] Pause email scraping failed:', error);
+        showToast('Could not pause extraction', 'warning');
+    }
+}
+
+async function resumeEmailScraping() {
+    try {
+        const response = await sendMessageWithTimeout({ action: 'resume_email_scraping' });
+        if (response?.status === 'resumed' || response?.status === 'already_running') {
+            state.isExtractingEmails = true;
+            state.isEmailExtractionPaused = false;
+            updateEmailExtractionUI(true);
+            showToast('📧 Email extraction resumed', 'success');
+            return;
+        }
+        // Fallback: start path now auto-resumes paused queues
+        const start = await sendMessageWithTimeout({ action: 'start_email_scraping' }, 45000);
+        if (start?.status === 'resumed' || start?.status === 'started' || start?.status === 'already_running') {
+            state.isExtractingEmails = true;
+            state.isEmailExtractionPaused = false;
+            updateEmailExtractionUI(true);
+            showToast('📧 Email extraction resumed', 'success');
+            return;
+        }
+        showToast('Could not resume extraction', 'warning');
+    } catch (error) {
+        console.error('[GhostMap] Resume email scraping failed:', error);
+        showToast('Could not resume extraction', 'error');
+    }
+}
+
+/** @deprecated use pauseEmailScraping — kept name for any leftover callers */
+async function stopEmailScraping() {
+    return pauseEmailScraping();
+}
+
+function setPauseButtonLabel(isPaused) {
+    if (!elements.stopEmailBtn) return;
+    const label = isPaused ? 'Resume' : 'Pause';
+    elements.stopEmailBtn.innerHTML = isPaused
+        ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 3 19 12 5 21 5 3" />
+           </svg> Resume`
+        : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="6" y="4" width="4" height="16" />
+                <rect x="14" y="4" width="4" height="16" />
+           </svg> Pause`;
+    // Ensure text is correct even if SVG strip fails in some hosts
+    if (!elements.stopEmailBtn.textContent.includes(label)) {
+        elements.stopEmailBtn.textContent = label;
+    }
+}
+
+function updateEmailProgressContext(jobTotal) {
+    if (!elements.emailProgressContext) return;
+    const leads = state.stats.total || 0;
+    const withWebsite = state.stats.withWebsite || 0;
+    const pending = state.stats.pending || 0;
+    const run = typeof jobTotal === 'number' ? jobTotal : (state.emailProgress?.total || 0);
+    elements.emailProgressContext.textContent =
+        `This run: ${run || '—'} websites · DB: ${leads} leads, ${withWebsite} with website` +
+        (pending > 0 ? `, ${pending} still pending email` : '');
 }
 
 // P3-002 FIX: Retry failed businesses
@@ -798,6 +952,7 @@ async function retryFailedBusinesses() {
 
         if (response?.success) {
             state.isExtractingEmails = true;
+            state.isEmailExtractionPaused = false;
             updateEmailExtractionUI(true);
             elements.retrySection.style.display = 'none';
             showToast(`Retrying ${response.count || 'failed'} businesses`, 'info');
@@ -823,51 +978,84 @@ async function retryFailedBusinesses() {
 }
 
 function updateEmailExtractionUI(isActive) {
+    const paused = state.isEmailExtractionPaused === true;
     elements.emailBtn.disabled = isActive;
     elements.stopEmailBtn.disabled = !isActive;
-    elements.emailProgressLabel.textContent = isActive ? 'Extracting emails...' : 'Ready to extract';
-    elements.statusIndicator.classList.toggle('active', isActive || state.isMonitoring);
-    elements.statusText.textContent = isActive ? 'Extracting' : (state.isMonitoring ? 'Monitoring' : 'Idle');
+    setPauseButtonLabel(paused);
 
-    if (isActive) {
+    if (isActive && paused) {
+        elements.emailProgressLabel.textContent = 'Paused — click Resume to continue';
+        elements.statusText.textContent = 'Paused';
+        elements.emailShimmer.parentElement.classList.remove('active');
+        elements.emailBtn.innerHTML = `
+            <div class="loading-spinner"></div>
+            Paused`;
+    } else if (isActive) {
+        elements.emailProgressLabel.textContent = 'Extracting emails...';
+        elements.statusIndicator.classList.toggle('active', true);
+        elements.statusText.textContent = 'Extracting';
         elements.emailShimmer.parentElement.classList.add('active');
         elements.emailBtn.innerHTML = `
             <div class="loading-spinner"></div>
             Extracting...`;
     } else {
+        elements.emailProgressLabel.textContent = 'Ready to extract';
+        elements.statusIndicator.classList.toggle('active', state.isMonitoring);
+        elements.statusText.textContent = state.isMonitoring ? 'Monitoring' : 'Idle';
         elements.emailShimmer.parentElement.classList.remove('active');
         elements.emailBtn.innerHTML = `
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <polygon points="5 3 19 12 5 21 5 3"/>
             </svg>
             Start Extraction`;
+        setPauseButtonLabel(false);
     }
+
+    elements.statusIndicator.classList.toggle('active', (isActive && !paused) || state.isMonitoring);
 }
 
 function updateEmailProgress(progress) {
     state.emailProgress = progress;
     elements.emailProgressBar.style.width = `${progress.percent}%`;
     elements.emailProgressPercent.textContent = `${Math.round(progress.percent)}%`;
-    elements.emailProgressStats.textContent = `${progress.current} / ${progress.total}`;
+
+    const pendingBit = typeof progress.pending === 'number' ? ` · ${progress.pending} queued` : '';
+    const failedBit = typeof progress.failed === 'number' && progress.failed > 0
+        ? ` · ${progress.failed} failed`
+        : '';
+    elements.emailProgressStats.textContent = `${progress.current} / ${progress.total}${pendingBit}${failedBit}`;
 
     if (progress.eta) {
         elements.emailProgressETA.textContent = `~${progress.eta} remaining`;
+    } else if (progress.isPaused || state.isEmailExtractionPaused) {
+        elements.emailProgressETA.textContent = 'Paused';
     } else if (progress.percent >= 100) {
         elements.emailProgressETA.textContent = 'Complete!';
     }
+
+    updateEmailProgressContext(progress.total);
 
     if (progress.currentItem) {
         elements.emailCurrentItem.style.display = 'flex';
         elements.emailCurrentText.textContent = progress.currentItem;
     }
 
+    if (progress.isPaused === true && state.isExtractingEmails) {
+        state.isEmailExtractionPaused = true;
+        updateEmailExtractionUI(true);
+    } else if (progress.isPaused === false && state.isEmailExtractionPaused && state.isExtractingEmails) {
+        state.isEmailExtractionPaused = false;
+        updateEmailExtractionUI(true);
+    }
+
     // FIX: Detect completion and reset UI when at 100%
     // If progress is 100% and current equals total, trigger completion
-    if (progress.percent >= 100 && progress.current >= progress.total && state.isExtractingEmails) {
+    if (progress.percent >= 100 && progress.current >= progress.total && state.isExtractingEmails && !state.isEmailExtractionPaused) {
         // Use a small delay to allow final messages to process
         setTimeout(() => {
-            if (state.isExtractingEmails && state.emailProgress?.percent >= 100) {
+            if (state.isExtractingEmails && state.emailProgress?.percent >= 100 && !state.isEmailExtractionPaused) {
                 state.isExtractingEmails = false;
+                state.isEmailExtractionPaused = false;
                 updateEmailExtractionUI(false);
                 elements.emailProgressLabel.textContent = 'Extraction complete!';
                 if (elements.exportTransition) {
@@ -934,6 +1122,7 @@ function updateStatsDebounced(stats, queueStatus = null) {
         withEmail: stats.withEmail || 0,
         withWebsite: stats.withWebsite || 0,
         withPhone: stats.withPhone || 0,
+        pending: stats.pending || 0,
         queue: queueStatus?.pending || stats.emailQueue || stats.queue || 0,
         failed: stats.failed || queueStatus?.failed || 0,
         successRate: stats.successRatePercent || stats.successRate || 0,
@@ -996,9 +1185,14 @@ function updateStatsDebounced(stats, queueStatus = null) {
         : '—';
     elements.phaseCounts[3].textContent = state.stats.total > 0 ? 'Ready' : '—';
 
-    // Queue count & transition CTA
-    elements.queueCount.textContent = state.stats.queue;
-    elements.extractTransition.style.display = state.stats.queue > 0 ? 'block' : 'none';
+    // Queue count & transition CTA — prefer DB pending-email candidates
+    // (websites not yet scraped), not only live job-queue depth.
+    const readyForEmail = state.stats.pending > 0
+        ? state.stats.pending
+        : state.stats.queue;
+    elements.queueCount.textContent = readyForEmail;
+    elements.extractTransition.style.display = readyForEmail > 0 ? 'block' : 'none';
+    updateEmailProgressContext(state.emailProgress?.total);
 
     // Phase 2 stats
     elements.successRate.textContent = `${state.stats.successRate}%`;
@@ -1232,6 +1426,41 @@ async function exportMD() {
     }
 }
 
+/**
+ * Same CSV source as Export CSV, then run the ledger pipeline
+ * (dedupe / owner vs generic / no-website / follow-up) and download .xlsx.
+ * Export CSV and Export MD are unchanged.
+ */
+async function exportXlsxFiltered() {
+    showLoading('Building filtered Excel…');
+    try {
+        if (!window.GhostMapLedger?.buildAndDownloadXlsx) {
+            throw new Error('Excel ledger module not loaded');
+        }
+        const response = await sendMessageWithTimeout({ action: 'export_data' }, 120000);
+        if (response?.status !== 'success' || !response.csv) {
+            throw new Error(response?.error || 'Export failed');
+        }
+        const { stats } = await window.GhostMapLedger.buildAndDownloadXlsx(
+            response.csv,
+            `ghost_map_ledger_${Date.now()}`
+        );
+        const unique = stats?.uniqueTotal ?? 0;
+        const dups = stats?.duplicateCount ?? 0;
+        const discarded = response.discarded || 0;
+        const baseMsg = `📗 Excel ledger: ${unique} unique` + (dups ? `, ${dups} duplicates` : '');
+        showToast(
+            discarded > 0 ? `${baseMsg} (${discarded} out of radius discarded)` : baseMsg,
+            'success'
+        );
+    } catch (error) {
+        console.error('[GhostMap] XLSX filtered export failed:', error);
+        showToast('Excel export failed: ' + (error?.message || error), 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
 function downloadFile(content, filename, mimeType) {
     // EXP-03 FIX (2026-06-09): prepend a UTF-8 BOM for CSV so Excel opens it as
     // UTF-8 on double-click — without it accented characters garble ("Caffè" →
@@ -1273,10 +1502,11 @@ async function resetAll() {
         const resetResponse = await sendMessageWithTimeout({ action: 'factory_reset' });
 
         // Reset state
-        state.stats = { total: 0, withEmail: 0, withWebsite: 0, withPhone: 0, queue: 0, failed: 0, successRate: 0, avgTime: null };
+        state.stats = { total: 0, withEmail: 0, withWebsite: 0, withPhone: 0, pending: 0, queue: 0, failed: 0, successRate: 0, avgTime: null };
         state.previousTotal = 0;
         state.activities = [];
         state.isExtractingEmails = false;
+        state.isEmailExtractionPaused = false;
         state.emailProgress = { current: 0, total: 0, percent: 0 };
 
         // FIX: Reset website extraction state (M7-MISS7)
@@ -1289,6 +1519,17 @@ async function resetAll() {
         elements.emailCount.textContent = '0';
         elements.websiteCount.textContent = '0';
         if (elements.phoneCount) elements.phoneCount.textContent = '0';
+        if (elements.phaseCounts?.[1]) elements.phaseCounts[1].textContent = '0';
+        if (elements.phaseCounts?.[2]) elements.phaseCounts[2].textContent = '—';
+        if (elements.phaseCounts?.[3]) elements.phaseCounts[3].textContent = '—';
+        if (elements.previewTotal) elements.previewTotal.textContent = '0';
+        if (elements.previewEmails) elements.previewEmails.textContent = '0';
+        if (elements.previewWebsites) elements.previewWebsites.textContent = '0';
+        if (elements.previewPhones) elements.previewPhones.textContent = '0';
+        if (elements.queueCount) elements.queueCount.textContent = '0';
+        if (elements.extractTransition) elements.extractTransition.style.display = 'none';
+        if (elements.failedCount) elements.failedCount.textContent = '0';
+        if (elements.failedBadge) elements.failedBadge.style.display = 'none';
 
         // FIX: Reset email progress bar UI to 0%
         elements.emailProgressBar.style.width = '0%';
@@ -1338,10 +1579,20 @@ async function resetAll() {
         // in another Maps tab) — tell the user instead of claiming success.
         if (resetResponse?.status === 'partial') {
             showToast(resetResponse.message || 'Reset incomplete — close other Ghost Map tabs and retry', 'error');
+            await loadStats(); // show real remaining numbers
         } else if (resetResponse?.status === 'error') {
             showToast('Reset failed — see logs', 'error');
+            await loadStats();
+        } else if (resetResponse?.status === 'timeout' || resetResponse?.status === 'lastError') {
+            showToast('Reset may not have finished — try again or reload the extension', 'warning');
+            await loadStats();
         } else {
             showToast('All data has been reset', 'success');
+            // Confirm UI stays at zero (stats poll can otherwise flash old numbers)
+            await loadStats();
+            if ((state.stats.total || 0) > 0) {
+                showToast('Data still present — close other Ghost Map windows and Reset again', 'warning');
+            }
         }
     } catch (error) {
         console.error('[GhostMap] Reset failed:', error);
@@ -1703,6 +1954,10 @@ function handleBackgroundMessage(message, sender, sendResponse) {
                     });
                 }
             }
+            // Always ACK: we own this action even when the feed filter drops it.
+            // Without this, SW broadcasts reject with "message port closed" /
+            // Unchecked runtime.lastError on chrome://extensions → Errors.
+            handled = true;
             break;
 
         // Census 2026-08-19 (§5.4): orphan aliases removed from this dispatcher —
@@ -1721,6 +1976,7 @@ function handleBackgroundMessage(message, sender, sendResponse) {
                 detail: message.business?.website || message.data?.website ? '+website' : 'no website'
             });
             loadStats();
+            handled = true;
             break;
 
         case 'email_found':
@@ -1733,6 +1989,7 @@ function handleBackgroundMessage(message, sender, sendResponse) {
                 detail: '+email'
             });
             loadStats();
+            handled = true;
             break;
 
         case 'scraping_progress':  // FIX: This is what background actually sends
@@ -1746,16 +2003,20 @@ function handleBackgroundMessage(message, sender, sendResponse) {
                 current: current,
                 total: total,
                 percent: percent,
+                pending: progressData.pending,
+                failed: progressData.failed,
+                isPaused: progressData.isPaused,
                 eta: progressData.eta || message.eta,
                 currentItem: progressData.currentItem || message.currentUrl || message.url
             });
+            handled = true;
             break;
 
         // UX-1 FIX (2026-05-15): Phase-2 heartbeat — emitted every 2s by the SW
         // while a batch is active. Keeps the progress bar moving even when no
         // email_found / job_complete events fire (slow CMSs, circuit-breaker
         // pause, tab-fallback cascade). Surfaces circuit-open state so the user
-        // sees "⚠️ Pausa: troppi siti falliscono" instead of a silent freeze.
+        // sees a clear pause reason instead of a silent freeze.
         case 'phase2_heartbeat': {
             const hb = message.payload || {};
             const hbTotal = hb.total || 0;
@@ -1764,13 +2025,25 @@ function handleBackgroundMessage(message, sender, sendResponse) {
             const hbCurrentItem = hb.activeNames && hb.activeNames.length > 0
                 ? hb.activeNames
                 : (hb.circuitOpen
-                    ? '⚠️ Pausa: troppi siti falliscono (riprova fra ~60s)'
-                    : (hb.isPaused ? '⏸ In pausa' : `${hb.active} attivi, ${hb.pending} in coda`));
+                    ? 'Paused: too many site failures (retry in ~60s)'
+                    : (hb.isPaused
+                        ? `Paused — ${hb.pending || 0} left in queue`
+                        : `${hb.active || 0} active, ${hb.pending || 0} queued`));
+
+            if (hb.isPaused === true) {
+                state.isExtractingEmails = true;
+                state.isEmailExtractionPaused = true;
+            } else if (state.isEmailExtractionPaused && (hb.pending > 0 || hb.active > 0)) {
+                state.isEmailExtractionPaused = false;
+            }
 
             updateEmailProgress({
                 current: hbProcessed,
                 total: hbTotal,
                 percent: hbPercent,
+                pending: hb.pending,
+                failed: hb.failed,
+                isPaused: hb.isPaused,
                 currentItem: hbCurrentItem
             });
 
@@ -1779,20 +2052,21 @@ function handleBackgroundMessage(message, sender, sendResponse) {
             const prevCircuitOpen = state._lastCircuitOpen === true;
             const nowCircuitOpen = hb.circuitOpen === true;
             if (nowCircuitOpen && !prevCircuitOpen) {
-                showToast('⚠️ Troppi fallimenti consecutivi — pausa di ~60s', 'info');
+                showToast('Too many consecutive failures — pausing ~60s', 'info');
                 addActivity({
-                    name: 'Circuit breaker aperto',
+                    name: 'Circuit breaker open',
                     status: 'info',
-                    detail: 'pausa ~60s'
+                    detail: 'pause ~60s'
                 });
             } else if (!nowCircuitOpen && prevCircuitOpen) {
                 addActivity({
-                    name: 'Circuit breaker chiuso',
+                    name: 'Circuit breaker closed',
                     status: 'success',
-                    detail: 'ripresa scraping'
+                    detail: 'resumed scraping'
                 });
             }
             state._lastCircuitOpen = nowCircuitOpen;
+            handled = true;
             break;
         }
 
@@ -1803,6 +2077,7 @@ function handleBackgroundMessage(message, sender, sendResponse) {
 
         case 'email_scraping_finished':
             state.isExtractingEmails = false;
+            state.isEmailExtractionPaused = false;
             updateEmailExtractionUI(false);
             stopLiveStatsPolling();  // FIX: Stop live stats polling when scraping ends
             const emailPayload = message.payload || message;
@@ -1814,17 +2089,20 @@ function handleBackgroundMessage(message, sender, sendResponse) {
             showToast(`✓ Email extraction complete: ${emailPayload.found || 0} emails found`, 'success');
             if (elements.exportTransition) elements.exportTransition.style.display = 'block';
             loadStats();
+            handled = true;
             break;
 
         case 'queue_progress':
         case 'queue_ready':
             // Queue status updates - refresh stats
             loadStats();
+            handled = true;
             break;
 
         case 'reset_complete':
             showToast('✓ Factory reset complete', 'success');
             loadStats();
+            handled = true;
             break;
 
         case 'website_extraction_progress':
@@ -1838,6 +2116,7 @@ function handleBackgroundMessage(message, sender, sendResponse) {
                 percent: wxTotal > 0 ? Math.round((wxCurrent / wxTotal) * 100) : 0,
                 message: wxProgress.currentItem || 'Processing...'
             });
+            handled = true;
             break;
 
         case 'website_extraction_finished':
@@ -1862,14 +2141,17 @@ function handleBackgroundMessage(message, sender, sendResponse) {
             showToast(`✓ Website extraction complete: ${wxFinished.found || 0} found`, 'success');
             addActivity({ name: 'Website extraction', status: 'success', detail: `+${wxFinished.found || 0}` });
             loadStats();
+            handled = true;
             break;
 
         case 'website_extraction_paused':
             showToast('⏸ Website extraction paused', 'info');
+            handled = true;
             break;
 
         case 'website_extraction_resumed':
             showToast('▶ Website extraction resumed', 'success');
+            handled = true;
             break;
 
         // ─── B12-1 FIX: orphan area_search_warning message handler ──────

@@ -26,7 +26,9 @@ const businessFoundDedupe = createBusinessFoundDedupe();
  */
 function initialize() {
     if (observer) {
-        logger.warn('Observer already initialized');
+        // Expected on SPA re-inject / area-search tab reuse — not an extension fault.
+        // console.warn is surfaced on chrome://extensions → Errors; keep at debug.
+        logger.debug('Observer already initialized');
         return;
     }
 
@@ -257,7 +259,9 @@ async function flushPendingBusinesses() {
                         // draining a full queue would hold the single-flight
                         // lock for minutes. Re-queue the rest untouched and
                         // let a later trigger retry.
-                        logger.warn('[S3] SW init_pending — deferring remaining queue entries');
+                        // Expected SW-wake path — use debug (not warn) so
+                        // unpacked installs don't light chrome://extensions Errors.
+                        logger.debug('[S3] SW init_pending — deferring remaining queue entries');
                         remaining.push(...pending.slice(processedCount));
                         break;
                     }
@@ -294,7 +298,8 @@ async function flushPendingBusinesses() {
         if (remaining.length === 0) {
             logger.info('[B2-7] Pending queue drained successfully');
         } else {
-            logger.warn(`[B2-7] Partial drain: ${remaining.length} entries still pending`);
+            // Expected while SW is waking — debug only (avoid Errors badge noise).
+            logger.debug(`[B2-7] Partial drain: ${remaining.length} entries still pending`);
         }
     } finally {
         _flushingPendingBusinesses = false;
@@ -327,7 +332,9 @@ function handleNewBusiness(business) {
             // here: init_pending already waited ~10s inside the SW's
             // _waitForInit, so an immediate retry adds nothing.
             if (!_isDeliveredResponse(response)) {
-                logger.warn(`[S3] Non-delivered response (status=${response?.status}); queuing for retry`);
+                // Expected while SW init/eviction races — queue + retry unchanged.
+                // debug (not warn): console.warn surfaces on chrome://extensions Errors.
+                logger.debug(`[S3] Non-delivered response (status=${response?.status}); queuing for retry`);
                 _appendPendingBusiness(business);
                 return;
             }
@@ -371,7 +378,7 @@ function handleNewBusiness(business) {
             );
             if (isTransient && attempt < maxRetries) {
                 const delay = Math.pow(2, attempt) * 100; // 200ms, 400ms, 800ms
-                logger.warn(`sendMessage retry ${attempt}/${maxRetries} in ${delay}ms (${msg.slice(0, 60)})`);
+                logger.debug(`sendMessage retry ${attempt}/${maxRetries} in ${delay}ms (${msg.slice(0, 60)})`);
                 await new Promise(r => setTimeout(r, delay));
                 return sendWithRetry(attempt + 1);
             }
